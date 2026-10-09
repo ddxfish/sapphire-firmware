@@ -32,13 +32,11 @@ bash build.sh cyd35 menuconfig
 ```
 
 The first build downloads the board's components. Each build ends by writing
-what a flasher needs into `dist/`:
+one file per board into `dist/` (`tools/pack.py`):
 
 ```
-dist/index.json                 the boards in this folder
-dist/cyd35-manifest.json        version, chip, the parts and where they go
-dist/cyd35-*.bin                the parts
-dist/cyd35-README.md
+dist/index.json                 every board here: version, chip, sha256, what sits where in its file
+dist/cyd35-0.3.0.bin            the whole board: bootloader, partition table, program
 ```
 
 To flash your own build from Sapphire, set **DEVICE_FIRMWARE_SOURCE** in her
@@ -47,9 +45,21 @@ up from a terminal instead.
 
 ## A release
 
-A release's files are everything in `dist/`, as they are. The names carry the
-board because a release has one flat list of files. Sapphire reads
-`index.json` first and downloads only the board that was picked.
+A release's files are everything in `dist/`: one `.bin` per board and
+`index.json`. Sapphire reads `index.json` first and downloads only the board
+that was picked.
+
+## By hand
+
+Download your board's `.bin` from the latest release and write it at address
+0 with any ESP flasher:
+
+```
+esptool.py write_flash 0x0 cyd35-0.3.0.bin
+```
+
+This also clears the board's saved name and WiFi, so it starts as a new
+board. Add it in Sapphire afterwards (**+ Add Device**).
 
 ## A new board
 
@@ -63,3 +73,18 @@ board because a release has one flat list of files. Sapphire reads
 
 A board that keeps two program slots (`partitions.csv`) and says `firmware`
 in `/health` gets its updates over WiFi after the first flash.
+
+## License
+
+The code here is under the GNU Affero General Public License v3 (`LICENSE`),
+like Sapphire.
+
+Not ours, and under their own terms:
+
+- `ai-speaker-mic/models/hey_jarvis.*`: the wake word model from ESPHome's
+  micro-wake-word-models, Apache License 2.0. See the `NOTICE` and `LICENSE`
+  in that folder.
+- What a build downloads into `managed_components/` (ESP-IDF components,
+  LVGL, TensorFlow Lite Micro and others): Apache 2.0 or MIT, each with its
+  license in its folder. Two of Espressif's, `esp-sr` and `esp_new_jpeg`, are
+  under the "Espressif MIT" license, which allows them on Espressif chips only.

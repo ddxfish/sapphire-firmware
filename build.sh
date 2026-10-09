@@ -34,5 +34,5 @@ case "${2:-build}" in
     clean) idf.py fullclean ;;
     menuconfig) idf.py menuconfig ;;
     *) idf.py build                    # the target comes from sdkconfig.defaults
-       python "$HERE/tools/manifest.py" "$BOARD" build "$HERE/dist" ;;
+       python "$HERE/tools/pack.py" "$BOARD" build "$HERE/dist" ;;
 esac
