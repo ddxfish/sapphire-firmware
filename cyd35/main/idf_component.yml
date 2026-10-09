@@ -1,0 +1,8 @@
+## From Espressif's component registry. ST7789 itself is in ESP-IDF (esp_lcd).
+dependencies:
+  idf: ">=5.5.3"
+  lvgl/lvgl: "^9.3"
+  espressif/esp_lvgl_port: "^2.6"
+  espressif/esp_lcd_touch_gt911: "^1.1"
+  espressif/esp_lcd_st7796: "^1.3"
+  espressif/mdns: "^1.4.0"

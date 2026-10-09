@@ -1,0 +1,20 @@
+# LVGL's statics (lv_global and the draw units' state) and the port's go to PSRAM:
+# internal RAM is the scarce thing (15 KB with them inside, 2026-10-07). Nothing of
+# either runs inside a cache-disabled window (flash writes happen on other tasks).
+[mapping:lvgl_bss_psram]
+archive: liblvgl__lvgl.a
+entries:
+    * (extram_bss)
+
+[mapping:lvgl_port_bss_psram]
+archive: libespressif__esp_lvgl_port.a
+entries:
+    * (extram_bss)
+
+# Ours as well: the wake word's pre-roll ring (8 KB), the settings block with her
+# certificate (5 KB), the model's variable arena, the stats rows. 18 KB of .bss sat in
+# internal RAM. Task control blocks are heap-allocated internal (task_in_psram), never static.
+[mapping:main_bss_psram]
+archive: libmain.a
+entries:
+    * (extram_bss)

@@ -1,0 +1,11 @@
+# made by a build
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+dist/
+__pycache__/
+*.pyc
+
+# what was on a board before the first flash (a vendor's program: never publish)
+backups/
