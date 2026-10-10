@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "buttons.h"
 #include "light.h"
 #include "net.h"
 #include "settings.h"
@@ -35,14 +36,17 @@ static int last_refusal;
 // --- what is being written ---------------------------------------------------------------
 // The reply the board follows: its id, its revision, how much Sapphire has,
 // how much the board has. `wanted` is set by a doorbell and cleared by a pull.
+// Sapphire counts characters (`from`, `have`), so msg_mine does too; msg_bytes
+// is where the next piece goes in `reply`. Counting bytes for both lost the
+// end of any reply with a curly quote or a dash in it (0.4.2).
 
 static SemaphoreHandle_t lock;
 static char msg_id[24], msg_rev[12];
-static int msg_have, msg_mine, msg_done;
+static int msg_have, msg_mine, msg_bytes, msg_done;
 static char *reply;                    // the text so far, REPLY_MAX + 1
 static bool wanted;
 
-typedef struct { char kind; char text[TYPED_MAX]; } job_t;   // 't' typed text, 'p' pull
+typedef struct { char kind; char text[TYPED_MAX]; } job_t;   // 't' typed text, 'p' pull, 'b' a button: "boot short"
 static QueueHandle_t jobs;
 
 static void url_for(const char *door, char *out, size_t size)
@@ -123,6 +127,50 @@ bool link_send_text(const char *text)
     return xQueueSend(jobs, &job, 0) == pdTRUE;
 }
 
+// --- a button set to reach her ---------------------------------------------------------------
+
+static void post_press(char *press)
+{
+    char *how = strchr(press, ' ');
+    if (!how) return;
+    *how++ = 0;
+    esp_http_client_handle_t c = open_client("press", HTTP_METHOD_POST, TEXT_WAIT_MS);
+    if (!c) { ui_failed("not sent: no memory"); return; }
+    char out[64];
+    int len = snprintf(out, sizeof out, "{\"button\": \"%s\", \"how\": \"%s\"}", press, how);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    bool ok = false, taken = false;
+    char why[96] = "not sent: Sapphire did not answer";
+    if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == len) {
+        char *body = malloc(1024);                 // the message set for the press comes back, to show it
+        int status = body ? small_answer(c, body, 1024) : -1;
+        cJSON *j = body ? cJSON_Parse(body) : NULL;
+        if (status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"))) {
+            ok = true;
+            taken = cJSON_IsTrue(cJSON_GetObjectItem(j, "accepted"));
+            const cJSON *said = cJSON_GetObjectItem(j, "text");
+            if (taken && cJSON_IsString(said)) ui_mine(said->valuestring);
+        } else {
+            const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+            snprintf(why, sizeof why, "not sent: %s", cJSON_IsString(e) ? e->valuestring
+                     : status == 401 ? "wrong key, or not added yet" : "no answer");
+        }
+        cJSON_Delete(j);
+        free(body);
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (!ok) { ui_failed(why); light_cue("error"); }
+    else if (!taken) { light_cue("idle"); ui_status(""); }   // nothing is set for it on her side: no turn will come
+}
+
+void link_press(const char *button, const char *how)
+{
+    job_t job = {.kind = 'b'};
+    snprintf(job.text, sizeof job.text, "%s %s", button, how);
+    if (!jobs || !net_up() || xQueueSend(jobs, &job, 0) != pdTRUE) light_cue("error");
+}
+
 // --- her words down -------------------------------------------------------------------------
 
 static void pull(void)
@@ -133,9 +181,10 @@ static void pull(void)
     strlcpy(id, msg_id, sizeof id);
     strlcpy(rev, msg_rev, sizeof rev);
     from = msg_mine;
+    bool full = msg_bytes >= REPLY_MAX;
     wanted = false;
     xSemaphoreGive(lock);
-    if (!id[0] || from >= REPLY_MAX) return;
+    if (!id[0] || full) return;
 
     char door[96];
     snprintf(door, sizeof door, "text?msg=%s&rev=%s&from=%d&max=%d", id, rev, from, PULL_MAX);
@@ -163,19 +212,21 @@ static void pull(void)
             // for the new one is queued already (a rewind here made two bubbles, 2026-10-06)
         } else if (got > mine) {
             snprintf(msg_rev, sizeof msg_rev, "%d", got);   // newer than any doorbell said: from the start
-            msg_mine = 0;
+            msg_mine = msg_bytes = 0;
             reply[0] = 0;
             wanted = true;
         } else if (cJSON_IsString(text) && cJSON_IsNumber(at) && (int)at->valuedouble == msg_mine) {
-            size_t room = REPLY_MAX - msg_mine;
-            size_t n = strlen(text->valuestring);
-            if (n > room) n = room;
-            memcpy(reply + msg_mine, text->valuestring, n);
-            msg_mine += n;
-            reply[msg_mine] = 0;
+            const char *t = text->valuestring;
+            size_t room = REPLY_MAX - msg_bytes, n = strlen(t);
+            bool cut = n > room;                              // the screen's limit: no more is asked for
+            if (cut) { n = room; while (n > 0 && (t[n] & 0xC0) == 0x80) n--; }   // never half a character
+            memcpy(reply + msg_bytes, t, n);
+            reply[msg_bytes + n] = 0;
+            msg_bytes = cut ? REPLY_MAX : msg_bytes + n;
+            for (size_t i = 0; i < n; i++) if ((t[i] & 0xC0) != 0x80) msg_mine++;
             changed = n > 0;
             if (cJSON_IsNumber(have)) msg_have = (int)have->valuedouble;
-            if (msg_mine < msg_have && n > 0) wanted = true;   // more than one pull's worth: again
+            if (msg_mine < msg_have && msg_bytes < REPLY_MAX && n > 0) wanted = true;   // more than one pull's worth: again
         }
     }
     xSemaphoreGive(lock);
@@ -195,17 +246,17 @@ static void doorbell(const cJSON *j)
     if (strcmp(id->valuestring, msg_id)) {
         strlcpy(msg_id, id->valuestring, sizeof msg_id);
         strlcpy(msg_rev, cJSON_IsString(rev) ? rev->valuestring : "0", sizeof msg_rev);
-        msg_mine = msg_have = msg_done = 0;
+        msg_mine = msg_bytes = msg_have = msg_done = 0;
         reply[0] = 0;
         fresh = true;
     } else if (cJSON_IsString(rev) && strcmp(rev->valuestring, msg_rev)) {
         strlcpy(msg_rev, rev->valuestring, sizeof msg_rev);
-        msg_mine = 0;
+        msg_mine = msg_bytes = 0;
         reply[0] = 0;
     }
     if (cJSON_IsNumber(have)) msg_have = (int)have->valuedouble;
     if (cJSON_IsTrue(done)) msg_done = 1;
-    if (msg_mine < msg_have && !wanted) { wanted = true; ring = true; }
+    if (msg_mine < msg_have && msg_bytes < REPLY_MAX && !wanted) { wanted = true; ring = true; }
     xSemaphoreGive(lock);
     if (fresh) ui_reply_begin();
     if (ring) { job_t job = {.kind = 'p'}; xQueueSend(jobs, &job, 0); }
@@ -234,6 +285,7 @@ static void take_line(const char *line)
             ui_status("");
         }
         else if (!strcmp(s, "text")) doorbell(j);
+        else if (!strcmp(s, "buttons")) buttons_bound(cJSON_GetObjectItem(j, "bound"));
         else if (!strcmp(s, "thinking")) { light_cue_from_brain(s); ui_status("thinking"); }
         else if (!strcmp(s, "tool")) {
             const cJSON *name = cJSON_GetObjectItem(j, "tool_name");
@@ -247,7 +299,7 @@ static void take_line(const char *line)
             ui_status(!strcmp(s, "error") ? "no answer" : "");
             if (!strcmp(s, "idle")) {
                 xSemaphoreTake(lock, portMAX_DELAY);
-                bool behind = msg_id[0] && msg_mine < msg_have && !wanted;
+                bool behind = msg_id[0] && msg_mine < msg_have && msg_bytes < REPLY_MAX && !wanted;
                 if (behind) wanted = true;
                 xSemaphoreGive(lock);
                 if (behind) { job_t job = {.kind = 'p'}; xQueueSend(jobs, &job, 0); }
@@ -312,6 +364,7 @@ static void client_task(void *arg)
     for (;;) {
         if (xQueueReceive(jobs, &job, portMAX_DELAY) != pdTRUE) continue;
         if (job.kind == 't') { light_cue("thinking"); ui_status("sending"); post_text(job.text); }
+        else if (job.kind == 'b') { light_cue("thinking"); ui_status("sending"); ui_wake(); post_press(job.text); }
         else if (job.kind == 'p') {
             pull();
             bool again;
@@ -324,7 +377,7 @@ static void client_task(void *arg)
             bool behind, pending;
             xSemaphoreTake(lock, portMAX_DELAY);
             pending = wanted;
-            behind = msg_id[0] && msg_mine < msg_have && msg_mine < REPLY_MAX;
+            behind = msg_id[0] && msg_mine < msg_have && msg_bytes < REPLY_MAX;
             if (behind) wanted = true;
             xSemaphoreGive(lock);
             if ((behind || pending) && job.text[0] < 6) {    // the last pieces first, then done again

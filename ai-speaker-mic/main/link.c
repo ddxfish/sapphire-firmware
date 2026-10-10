@@ -14,9 +14,11 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "audio.h"
+#include "buttons.h"
 #include "light.h"
 #include "net.h"
 #include "settings.h"
@@ -26,10 +28,14 @@
 static const char *TAG = "link";
 static bool connected;
 static int last_refusal;               // the events door's last status, said once
-#define VOICE_WAIT_MS 40000            // her answer comes once the words are known
+#define VOICE_WAIT_MS 90000            // her answer comes once the words are known: a minute of talk takes a while to hear
 #define CLAIM_WAIT_MS 3000             // the room is decided in a moment, or not at all
 #define EVENTS_QUIET_MS 45000          // a comment line arrives every 20 s
 #define EVENT_LINE 1024
+#define PRESS_WAIT_MS 15000            // answered once a turn has started
+
+typedef struct { char button[16], how[8]; } press_t;
+static QueueHandle_t presses;
 
 static void url_for(const char *door, char *out, size_t size)
 {
@@ -129,6 +135,52 @@ bool link_claim_wake(char *taken_by, size_t size)
     return mine;
 }
 
+// --- a button set to reach her ---------------------------------------------------------
+
+static void send_press(const press_t *p)
+{
+    esp_http_client_handle_t c = open_client("press", HTTP_METHOD_POST, PRESS_WAIT_MS);
+    if (!c) { light_cue("error"); return; }
+    char out[64], body[512] = {0};
+    int len = snprintf(out, sizeof out, "{\"button\": \"%s\", \"how\": \"%s\"}", p->button, p->how);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    bool ok = false, taken = false;
+    if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == len
+            && esp_http_client_fetch_headers(c) >= 0) {
+        int n = esp_http_client_read_response(c, body, sizeof body - 1);
+        if (n > 0) body[n] = 0;
+        cJSON *j = cJSON_Parse(body);
+        ok = esp_http_client_get_status_code(c) == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"));
+        taken = ok && cJSON_IsTrue(cJSON_GetObjectItem(j, "accepted"));
+        const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+        if (!ok) ESP_LOGW(TAG, "press door answered %d: %s", esp_http_client_get_status_code(c),
+                          cJSON_IsString(e) ? e->valuestring : body);
+        cJSON_Delete(j);
+    } else {
+        ESP_LOGW(TAG, "the press did not reach Sapphire");
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (!ok) light_cue("error");
+    else if (!taken) light_cue("idle");          // nothing is set for it on her side: no turn, no cue will come
+}
+
+static void press_task(void *arg)
+{
+    press_t p;
+    for (;;)
+        if (xQueueReceive(presses, &p, portMAX_DELAY) == pdTRUE) send_press(&p);
+}
+
+void link_press(const char *button, const char *how)
+{
+    press_t p = {0};
+    strlcpy(p.button, button, sizeof p.button);
+    strlcpy(p.how, how, sizeof p.how);
+    if (!presses || !net_up() || xQueueSend(presses, &p, 0) != pdTRUE) { light_cue("error"); return; }
+    light_cue("thinking");                       // at once: her own cue follows when the turn starts
+}
+
 // --- what the light should show ------------------------------------------------------
 
 static void take_line(const char *line)
@@ -153,6 +205,7 @@ static void take_line(const char *line)
             light_cue_from_brain("idle");
         }
         else if (!strcmp(state->valuestring, "standdown")) wake_standdown("Sapphire's own microphone");
+        else if (!strcmp(state->valuestring, "buttons")) buttons_bound(cJSON_GetObjectItem(j, "bound"));
         else light_cue_from_brain(state->valuestring);
     }
     cJSON_Delete(j);
@@ -223,6 +276,8 @@ void link_start(void)
     if (started) return;
     started = true;
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_ERROR);    // "skip_common_name" is by design, every time
+    presses = xQueueCreate(4, sizeof(press_t));
+    task_in_psram(press_task, "press", 8192, 4, 1);
     task_in_psram(events_task, "events", 8192, 4, 1);   // core 1: core 0 is WiFi + the AFE's feed; no flash writes on it
 }
 

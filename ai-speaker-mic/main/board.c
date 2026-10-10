@@ -30,6 +30,7 @@ static board_glass_t glass;
 static const char *trouble = "";       // why board_init stopped, in words, for /health
 static int touch_errors, touch_bad, bus_resets, bus_held;   // bus_held: clock pulses it took to free SDA at boot, 0 = it was free
 static int64_t touch_rest_until;
+static int key_errors;                 // failed reads of the three keys
 #define TOUCH_TIMEOUT_MS 30            // one poll of the touch chip; the library's 0 means forever (the 2026-10-08 freeze)
 #define TOUCH_BAD_ROW 30               // this many failed polls in a row (a second): the poll rests a second
 
@@ -39,6 +40,7 @@ static int64_t touch_rest_until;
 #define PIN_CAMERA_DOWN IO_EXPANDER_PIN_NUM_5
 #define PIN_CAMERA_SEL IO_EXPANDER_PIN_NUM_6
 #define PIN_SD_CS IO_EXPANDER_PIN_NUM_3          // the card's D3/CS (board.h)
+#define PIN_KEYS (IO_EXPANDER_PIN_NUM_9 | IO_EXPANDER_PIN_NUM_10 | IO_EXPANDER_PIN_NUM_11)   // Key1..Key3 (board.h)
 
 static bool expander_init(void)
 {
@@ -192,6 +194,25 @@ bool board_sd_select(bool high)
 void board_camera_power(bool on)
 {
     if (expander) esp_io_expander_set_level(expander, PIN_CAMERA_DOWN, on ? 0 : 1);   // PWDN is active high
+}
+
+// One read of the expander's inputs, from the buttons' task. A failed read
+// is "not known" and a second's rest, never a stop: the bus is shared with
+// the codecs, the touch chip and the camera, and the library waits a whole
+// second on a bus that does not answer.
+int board_keys(void)
+{
+    static int64_t rest_until;
+    if (!expander) return -1;
+    int64_t now = esp_timer_get_time();
+    if (now < rest_until) return -1;
+    uint32_t levels = 0;
+    if (esp_io_expander_get_level(expander, PIN_KEYS, &levels) != ESP_OK) {
+        key_errors++;
+        rest_until = now + 1000000;
+        return -1;
+    }
+    return (int)((~levels >> 9) & 7);
 }
 
 void board_amplifier(bool on)

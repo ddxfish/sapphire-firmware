@@ -2,6 +2,7 @@
 // PSRAM, it never writes flash) and a lock for everyone else. LVGL's heap is
 // PSRAM too (lv_mem_psram.c); only the two draw buffers are internal DMA RAM.
 #include "ui.h"
+#include "buttons.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,15 +116,14 @@ static bool tap_taken(void)
     return false;
 }
 
+// A corner is a button like any other (buttons.h): its tap does what Sapphire
+// set for it, else its own job. The job runs on the buttons' task.
+static const char *CORNER[4] = {"top-left", "top-right", "bottom-left", "bottom-right"};
+
 static void on_zone(lv_event_t *e)
 {
     if (tap_taken()) return;
-    switch ((int)(intptr_t)lv_event_get_user_data(e)) {
-    case 0: light_toggle_dark(); break;                                      // the ring
-    case 1: screen_on = false; board_backlight(0); break;                    // the screen: a touch brings it back
-    case 2: wake_enable(!wake_enabled()); break;                             // the wake word
-    case 3: audio_set_mute(!audio_muted()); break;                           // the speaker
-    }
+    buttons_tap(CORNER[(int)(intptr_t)lv_event_get_user_data(e)]);
 }
 
 static void on_middle(lv_event_t *e)
@@ -139,17 +139,28 @@ static void on_catcher(lv_event_t *e) { tap_taken(); }
 
 // Only what changed is touched: every set invalidates, and a redraw ten times a
 // second for nothing cost a third of core 1 (2026-10-07).
+// Each corner wears the sign of the job its tap does now, lit while that thing is on.
 static void draw_zones(void)
 {
-    static const char *icons[4] = {LV_SYMBOL_TINT, LV_SYMBOL_POWER, LV_SYMBOL_BELL, LV_SYMBOL_VOLUME_MAX};   // ring, screen, wake word, voice
+    static const struct { const char *job, *icon; } SIGNS[] = {
+        {"light", LV_SYMBOL_TINT}, {"screen", LV_SYMBOL_POWER}, {"wake", LV_SYMBOL_BELL},
+        {"mute", LV_SYMBOL_VOLUME_MAX}, {"listen", LV_SYMBOL_AUDIO}, {"tell", LV_SYMBOL_ENVELOPE},
+    };
     static int was[4] = {-1, -1, -1, -1};
-    bool on[4] = {!light_is_dark(), screen_on, wake_enabled(), !audio_muted()};
+    bool on[] = {!light_is_dark(), screen_on, wake_enabled(), !audio_muted(), true, true};
     for (int i = 0; i < 4; i++) {
-        if (was[i] == (int)on[i]) continue;
-        was[i] = on[i];
-        lv_label_set_text(zone_lbl[i], i == 3 && !on[3] ? LV_SYMBOL_MUTE : icons[i]);
-        lv_obj_set_style_text_color(zone_lbl[i], on[i] ? lv_color_white() : C_OFF, 0);
-        lv_obj_set_style_bg_color(zone_btn[i], on[i] ? C_BTN_ON : C_BTN_OFF, 0);
+        char job[BUTTON_JOB];
+        int sign = -1;
+        if (buttons_does(CORNER[i], PRESS_SHORT, job, sizeof job))
+            for (int k = 0; k < (int)(sizeof SIGNS / sizeof SIGNS[0]); k++)
+                if (!strcmp(job, SIGNS[k].job)) sign = k;
+        bool lit = sign >= 0 && on[sign];
+        int now = (sign + 1) * 2 + lit;
+        if (was[i] == now) continue;
+        was[i] = now;
+        lv_label_set_text(zone_lbl[i], sign < 0 ? "" : sign == 3 && !lit ? LV_SYMBOL_MUTE : SIGNS[sign].icon);
+        lv_obj_set_style_text_color(zone_lbl[i], lit ? lv_color_white() : C_OFF, 0);
+        lv_obj_set_style_bg_color(zone_btn[i], lit ? C_BTN_ON : C_BTN_OFF, 0);
     }
 }
 
@@ -586,10 +597,12 @@ bool ui_screen_power(bool on)
 
 bool ui_screen_on(void) { return screen_on; }
 
-// After the brightness settings change: shown at once, as if it had just been touched.
+// After the screen's settings change: shown at once, as if it had just been touched,
+// and painted afresh (a turned panel keeps its old picture until then).
 bool ui_relight(void)
 {
     if (!ok || !take()) return false;
+    lv_obj_invalidate(lv_screen_active());
     if (screen_on) wake_screen();
     lvgl_port_unlock();
     return true;

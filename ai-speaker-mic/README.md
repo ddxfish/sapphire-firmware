@@ -11,7 +11,7 @@ of 7 lights, 8 MB PSRAM, 16 MB flash).
 | Version 0.3 does | Not yet |
 |---|---|
 | Wake word, then a question to Sapphire | The ring as a light she can set |
-| Her answer through the speaker | The buttons, the touch top |
+| Her answer through the speaker | The touch top |
 | `listen` on demand | |
 | Restart and sleep from Sapphire | |
 | Backups on the SD card (0.2.0) | |
@@ -94,6 +94,7 @@ meanwhile, the write runs on its own task.
 | `main/settings.c` | Flash storage of the settings |
 | `main/storage.c` | The SD card: mount, the sealed-only write, format |
 | `main/ui.c` | The glass: the scene, the five touch zones, her line, her picture, what she heard |
+| `main/buttons.c` | BOOT as a button (0.6.0): short, long and double press. Left alone a short press listens, or stops her while she speaks. The three keys on the port expander (Key1 to Key3, read 30 times a second) and the glass's four corners (a tap is a short press) are buttons too (0.6.1); left alone the keys turn the wake word, the speaker and the ring on or off. In Settings > Devices each press can be set to a message for Sapphire or to one of the board's own jobs (listen, ring, screen, wake word, speaker); the board is told on its events stream. The same file on every board; the jobs are in `main.c` |
 | `main/camera.c` | The eye: the probe at boot, a shot on demand, powered down between |
 | `main/stats.c` | Where the time goes: run-time stats, idle per core |
 | `main/lv_mem_psram.c` | LVGL's heap on PSRAM |

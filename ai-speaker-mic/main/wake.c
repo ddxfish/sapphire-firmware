@@ -19,13 +19,13 @@
 #include "light.h"
 #include "link.h"
 #include "mww.h"
+#include "settings.h"
 #include "ui.h"
 
 static const char *TAG = "wake";
 
 #define MODEL_NAME "hey_jarvis"        // the open test model, until "hey sapphire" is trained
-#define MAX_RECORD_S 60                // the buffer: a room recording through /audio/listen (1.9 MB of PSRAM)
-#define QUESTION_MAX_S 15              // a question after the wake word
+#define MAX_RECORD_S QUESTION_MAX_S_MOST   // the buffer, 1.9 MB of PSRAM: the longest question (settings.question_max_s) or room recording
 #define PREROLL_MS 250                 // the moment before the wake word ended, kept
 #define NO_SPEECH_MS 4000              // woke, and nobody said anything
 #define QUIET_END_MS 700               // silence after speech that ends the question
@@ -172,7 +172,7 @@ static void on_audio(const int16_t *pcm, size_t samples, bool speech)
         if (forget) { forget = false; mww_reset(); }
         if (enabled && mww_feed(pcm, samples)) {
             ESP_LOGI(TAG, "wake word");
-            begin(false, (size_t)AUDIO_RATE * QUESTION_MAX_S);
+            begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
         }
         return;
     }
@@ -249,7 +249,7 @@ void wake_trigger(void)
 {
     if (!audio_ok() || state != IDLE) return;
     ESP_LOGI(TAG, "listening by hand");
-    begin(false, (size_t)AUDIO_RATE * QUESTION_MAX_S);
+    begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
 }
 void wake_enable(bool on) { enabled = on; if (!on) forget = true; }   // called from the glass's task and the server's: never the model itself
 bool wake_running(void) { return running && audio_ok(); }

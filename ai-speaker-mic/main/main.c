@@ -17,6 +17,7 @@
 
 #include "audio.h"
 #include "board.h"
+#include "buttons.h"
 #include "camera.h"
 #include "console.h"
 #include "lastwords.h"
@@ -75,6 +76,49 @@ static void watch_task(void *arg)
     }
 }
 
+// --- the buttons (buttons.h): BOOT, the keys, the glass's corners. Each does one of these jobs, or what Sapphire set. ---
+
+static void job_listen(void)
+{
+    if (server_speaking()) server_stop_speech();
+    else wake_trigger();
+}
+static void job_light(void) { light_toggle_dark(); }
+static void job_screen(void) { ui_screen_power(!ui_screen_on()); }
+static void job_wake(void) { wake_enable(!wake_enabled()); }
+static void job_mute(void) { audio_set_mute(!audio_muted()); }
+
+static const button_job_t JOBS[] = {
+    {"listen", "Listen now, or stop her while she speaks", job_listen},
+    {"light", "Ring on or off", job_light},
+    {"screen", "Screen on or off", job_screen},
+    {"wake", "Wake word on or off", job_wake},
+    {"mute", "Speaker on or off", job_mute},
+};
+// BOOT, the three keys on the expander, then the glass's four corners (ui.c taps them by name).
+// Left alone, the keys do what the corners do, for a board with no glass.
+#define FIRST_KEY 1
+static const button_def_t BUTTONS[] = {
+    {"boot", BOARD_BOOT_BUTTON, {"listen", NULL, NULL}},
+    {"key1", BUTTON_FED, {"wake", NULL, NULL}},
+    {"key2", BUTTON_FED, {"mute", NULL, NULL}},
+    {"key3", BUTTON_FED, {"light", NULL, NULL}},
+    {"top-left", BUTTON_TAP, {"light", NULL, NULL}},
+    {"top-right", BUTTON_TAP, {"screen", NULL, NULL}},
+    {"bottom-left", BUTTON_TAP, {"wake", NULL, NULL}},
+    {"bottom-right", BUTTON_TAP, {"mute", NULL, NULL}},
+};
+
+static void buttons_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(30));
+        int keys = board_keys();                       // one small read of the shared bus
+        for (int k = 0; keys >= 0 && k < BOARD_KEYS; k++) buttons_feed(FIRST_KEY + k, keys >> k & 1);
+        buttons_poll();
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Sapphire satellite %s", PROJECT_VER);
@@ -103,6 +147,8 @@ void app_main(void)
     wake_start();
     room("after sound");
     storage_start();                   // the card: its CS line is on the expander
+    buttons_setup(BUTTONS, ui_ok() ? 8 : FIRST_KEY + BOARD_KEYS, JOBS, sizeof JOBS / sizeof JOBS[0]);   // no glass, no corners
+    task_in_psram(buttons_task, "buttons", 4096, 4, 1);   // its jobs flip flags and never write flash
     room("after card");
     if (!settings_ready()) {
         ESP_LOGW(TAG, "not set up yet: run setup_board.py setup");

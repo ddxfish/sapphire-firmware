@@ -24,6 +24,7 @@ void ui_reply_begin(void);                 // a new bubble of hers starts
 void ui_reply_set(const char *text);       // everything of her reply so far
 void ui_reply_done(void);
 void ui_failed(const char *why);           // the last thing you typed did not reach her
+void ui_mine(const char *text);            // a bubble of yours that was not typed: what a button sent
 void ui_toast(const char *text, int seconds);   // a line across the top, for a while
 void ui_test_card(void);                   // frame, TOP, color bars, a touch echo on the serial line
 void ui_wake(void);                        // the backlight back on

@@ -37,6 +37,7 @@ void settings_load(void)
     settings.volume = VOLUME_DEFAULT;
     settings.mic_gain_x2 = MIC_GAIN_X2_DEFAULT;
     settings.agc = false;
+    settings.question_max_s = QUESTION_MAX_S_DEFAULT;
     settings.invert = true;
     settings.flip = false;
     settings.brightness = BRIGHTNESS_DEFAULT;
@@ -58,6 +59,7 @@ void settings_load(void)
     uint8_t v8;
     if (nvs_get_u8(h, "mic_gain_x2", &v8) == ESP_OK && v8 <= MIC_GAIN_X2_MAX) settings.mic_gain_x2 = v8;
     if (nvs_get_u8(h, "agc", &v8) == ESP_OK) settings.agc = v8 != 0;
+    if (nvs_get_u8(h, "q_max_s", &v8) == ESP_OK && v8 >= QUESTION_MAX_S_LEAST && v8 <= QUESTION_MAX_S_MOST) settings.question_max_s = v8;
     if (nvs_get_u8(h, "invert", &v8) == ESP_OK) settings.invert = v8 != 0;
     if (nvs_get_u8(h, "flip", &v8) == ESP_OK) settings.flip = v8 != 0;
     if (nvs_get_u8(h, "bright", &v8) == ESP_OK && v8 <= 100) settings.brightness = v8;
@@ -79,6 +81,7 @@ bool settings_save(void)
     ok = ok && nvs_set_u8(h, "volume", settings.volume) == ESP_OK;
     ok = ok && nvs_set_u8(h, "mic_gain_x2", settings.mic_gain_x2) == ESP_OK;
     ok = ok && nvs_set_u8(h, "agc", settings.agc ? 1 : 0) == ESP_OK;
+    ok = ok && nvs_set_u8(h, "q_max_s", settings.question_max_s) == ESP_OK;
     ok = ok && nvs_set_u8(h, "invert", settings.invert ? 1 : 0) == ESP_OK;
     ok = ok && nvs_set_u8(h, "flip", settings.flip ? 1 : 0) == ESP_OK;
     ok = ok && nvs_set_u8(h, "bright", settings.brightness) == ESP_OK;
@@ -103,6 +106,7 @@ void settings_erase(void)
     settings.volume = VOLUME_DEFAULT;
     settings.mic_gain_x2 = MIC_GAIN_X2_DEFAULT;
     settings.agc = false;
+    settings.question_max_s = QUESTION_MAX_S_DEFAULT;
     settings.invert = true;
     settings.flip = false;
     settings.brightness = BRIGHTNESS_DEFAULT;

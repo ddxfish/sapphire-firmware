@@ -18,6 +18,7 @@ typedef struct {
     char cert[CERT_MAX];               // Sapphire's certificate, or empty = not checked
     int volume;                        // the speaker, 0 to 100
     int mic_gain_x2;                   // the microphones, in half decibels: 0..75 = 0..37.5 dB (the ES7210's range)
+    int question_max_s;                // a question is cut off at this many seconds, however long the talk
     bool agc;                          // the AFE's automatic gain control; applied when the AFE starts
     bool invert;                       // the glass: inverted colors (this panel wants it, as Xiaozhi found)
     bool flip;                         // the glass: 180 degrees
@@ -30,6 +31,10 @@ typedef struct {
 #define BRIGHTNESS_DEFAULT 80
 #define DIM_PERCENT_DEFAULT 15
 #define DIM_AFTER_S_DEFAULT 120
+
+#define QUESTION_MAX_S_DEFAULT 30
+#define QUESTION_MAX_S_LEAST 5
+#define QUESTION_MAX_S_MOST 60          // what the recording buffer holds (wake.c)
 
 #define VOLUME_DEFAULT 85
 #define MIC_GAIN_X2_DEFAULT 60           // 30 dB, the value the first firmware hard-coded

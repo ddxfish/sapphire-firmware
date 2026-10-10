@@ -79,8 +79,12 @@ for a post or a pull, so this board never holds more than two TLS sessions
 The screen is a window, not a transcript: the last 12 bubbles, one reply
 drawn up to 2400 characters. Everything stays in the chat on Sapphire's side.
 
-BOOT button: a tap shows or hides the keyboard (and wakes the screen); two
-seconds clears the window. The backlight dims after 90 s untouched.
+BOOT button (0.4.0, `main/buttons.c`): a tap shows or hides the keyboard
+(and wakes the screen); held most of a second it clears the window. In
+Settings > Devices each press (short, long, double) can be set to a message
+for Sapphire or to one of the board's own jobs (keyboard, clear, screen
+on or off); what a button sent shows as your bubble. The backlight dims
+after 90 s untouched.
 
 Opening the serial port resets the board (the CH340 auto-reset wiring), so
 `setup_board.py` waits for the boot after every open. Bring-up tools on the
@@ -93,7 +97,8 @@ raw, `test` is the card.
 |---|---|
 | `main/main.c` | Boot order |
 | `main/board.c` | This board's pins: panel, touch, backlight, LED, light sensor, button |
-| `main/ui.c` | The screen: bubbles, keyboard, status bar, the test card |
+| `main/ui.c` | The screen: bubbles, keyboard, status bar, the test card, the button's jobs |
+| `main/buttons.c` | The button's timing: short, long, double. The same file on every board |
 | `main/link.c` | What the board sends to Sapphire, the events stream, the pulls |
 | `main/server.c` | The addresses Sapphire calls |
 | `main/light.c` | The LED, in the ring's words |

@@ -12,6 +12,7 @@
 #include "lvgl.h"
 
 #include "board.h"
+#include "buttons.h"
 #include "link.h"
 #include "pet.h"
 #include "settings.h"
@@ -34,8 +35,7 @@ static void show_page(int which);
 static lv_obj_t *reply;                // her bubble being written, or NULL
 static lv_timer_t *toast_timer, *clock_timer, *watch_timer;
 static char status_text[48];
-static bool dimmed;
-static int64_t button_down_ms;
+static bool dimmed, dark;                  // dimmed comes by itself; dark is the button's "screen" job. A touch ends both
 static volatile bool picture_on;           // server.c holds the glass and the LVGL lock
 static bool pending_begin;                 // a reply began behind the picture
 static char *pending_reply;                // its text so far
@@ -170,29 +170,41 @@ static void draw_status(void)
 
 static void on_clock(lv_timer_t *t) { draw_status(); }
 
+// BOOT's jobs (buttons.h). They run inside on_watch, on LVGL's task: no lock to take.
+// Left to the board, a tap brings the keyboard and a hold clears the window.
+
+static void job_keyboard(void)
+{
+    if (dimmed || dark) { dimmed = dark = false; board_backlight(settings.brightness); lv_display_trigger_activity(disp); }
+    else if (page != 0) show_page(0);
+    else keyboard_show(lv_obj_has_flag(keyboard, LV_OBJ_FLAG_HIDDEN));
+}
+
+static void job_clear(void) { lv_obj_clean(list); reply = NULL; }
+
+static void job_screen(void)
+{
+    dark = !dark;
+    dimmed = false;
+    board_backlight(dark ? 0 : settings.brightness);
+    if (!dark) lv_display_trigger_activity(disp);
+}
+
+static const button_job_t JOBS[] = {
+    {"keyboard", "Show or hide the keyboard", job_keyboard},
+    {"clear", "Clear the chat window", job_clear},
+    {"screen", "Screen on or off", job_screen},
+};
+static const button_def_t BUTTONS[] = {{"boot", BOARD_BOOT_BUTTON, {"keyboard", "clear", NULL}}};
+
 static void on_watch(lv_timer_t *t)
 {
     // the backlight: a glow after a while untouched, back at a touch or the button
     uint32_t idle = lv_display_get_inactive_time(disp);
-    if (!dimmed && idle > DIM_AFTER_S * 1000) { dimmed = true; board_backlight(DIM_PERCENT); }
+    if (dark) { if (idle < 1000) { dark = false; board_backlight(settings.brightness); } }
+    else if (!dimmed && idle > DIM_AFTER_S * 1000) { dimmed = true; board_backlight(DIM_PERCENT); }
     else if (dimmed && idle < 1000) { dimmed = false; board_backlight(settings.brightness); }
-    // BOOT: a tap brings the keyboard; two seconds clears the window
-    int64_t now = lv_tick_get();
-    if (board_button()) {
-        if (!button_down_ms) button_down_ms = now;
-        else if (now - button_down_ms > 2000) {
-            lv_obj_clean(list);
-            reply = NULL;
-            button_down_ms = -1;                       // done until released
-        }
-    } else if (button_down_ms > 0) {
-        if (dimmed) { dimmed = false; board_backlight(settings.brightness); }
-        else if (page != 0) show_page(0);
-        else keyboard_show(lv_obj_has_flag(keyboard, LV_OBJ_FLAG_HIDDEN));
-        button_down_ms = 0;
-    } else {
-        button_down_ms = 0;
-    }
+    buttons_poll();
 }
 
 static void on_toast_end(lv_timer_t *t)
@@ -356,7 +368,8 @@ static void build(void)
     lv_obj_add_flag(toast, LV_OBJ_FLAG_HIDDEN);
 
     clock_timer = lv_timer_create(on_clock, 10000, NULL);
-    watch_timer = lv_timer_create(on_watch, 60, NULL);
+    buttons_setup(BUTTONS, 1, JOBS, sizeof JOBS / sizeof JOBS[0]);
+    watch_timer = lv_timer_create(on_watch, 40, NULL);      // also acts on the button (buttons.c reads the pin itself)
 }
 
 void ui_start(void)
@@ -451,6 +464,15 @@ void ui_failed(const char *why)
     lvgl_port_unlock();
 }
 
+void ui_mine(const char *text)
+{
+    if (!disp || picture_on) return;
+    lvgl_port_lock(0);
+    char *copy = strndup(text ? text : "", 300);
+    if (copy) { fold(copy); bubble(false, copy); free(copy); }
+    lvgl_port_unlock();
+}
+
 void ui_toast(const char *text, int seconds)
 {
     if (!disp || picture_on) return;
@@ -467,7 +489,7 @@ void ui_toast(const char *text, int seconds)
 
 void ui_wake(void)
 {
-    if (dimmed) { dimmed = false; board_backlight(settings.brightness); }
+    if (dimmed || dark) { dimmed = dark = false; board_backlight(settings.brightness); }
     if (disp) lv_display_trigger_activity(disp);
 }
 
@@ -475,7 +497,7 @@ bool ui_picture_begin(void)
 {
     if (!disp || picture_on || !lvgl_port_lock(1500)) return false;
     picture_on = true;
-    if (dimmed) { dimmed = false; board_backlight(settings.brightness); }
+    if (dimmed || dark) { dimmed = dark = false; board_backlight(settings.brightness); }
     return true;
 }
 

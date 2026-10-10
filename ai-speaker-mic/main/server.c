@@ -36,6 +36,7 @@
 #include "wake.h"
 #include "wav.h"
 #include "board.h"
+#include "buttons.h"
 
 static const char *TAG = "server";
 static httpd_handle_t server;
@@ -130,6 +131,8 @@ static esp_err_t on_health(httpd_req_t *req)
     }
     cJSON_AddItemToArray(has, cJSON_CreateString("light"));
     cJSON_AddItemToArray(has, cJSON_CreateString("power"));
+    cJSON_AddItemToArray(has, cJSON_CreateString("buttons"));   // BOOT (0.6.0): what each press is set to comes on the events stream
+    cJSON_AddItemToObject(j, "buttons", buttons_json());
     if (ui_ok()) {
         cJSON_AddItemToArray(has, cJSON_CreateString("screen"));
         cJSON *screen = cJSON_AddObjectToObject(j, "screen");    // what /screen/picture and /screen/background take
@@ -148,6 +151,7 @@ static esp_err_t on_health(httpd_req_t *req)
         cJSON_AddNumberToObject(screen, "dim", settings.dim_percent);
         cJSON_AddNumberToObject(screen, "dim_after_s", settings.dim_after_s);
         cJSON_AddNumberToObject(screen, "off_after_min", settings.off_after_min);
+        cJSON_AddBoolToObject(screen, "flip", settings.flip);
     }
     cJSON *mute = cJSON_AddObjectToObject(j, "mute");
     cJSON_AddBoolToObject(mute, "speaker", audio_muted());
@@ -196,6 +200,7 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON *mic = cJSON_AddObjectToObject(j, "mic");
     cJSON_AddNumberToObject(mic, "gain_db", audio_mic_gain());
     cJSON_AddBoolToObject(mic, "agc", settings.agc);
+    cJSON_AddNumberToObject(mic, "max_s", settings.question_max_s);
     // how it is doing (0.5.2): what did not start, how this boot began, why the last one ended
     cJSON *problems = cJSON_AddArrayToObject(j, "problems");
     if (board_trouble()[0]) cJSON_AddItemToArray(problems, cJSON_CreateString(board_trouble()));
@@ -597,6 +602,7 @@ static esp_err_t on_volume(httpd_req_t *req)
 //   GET  /mic                      {"gain_db": 30, "gain_max_db": 37.5, "agc": false}
 //   POST /mic?gain=36              live and saved
 //   POST /mic?agc=on|off           saved; the board restarts in two seconds, the AFE only reads it at start
+//   POST /mic?max_s=30             saved: a question is cut off at this many seconds (5 to 60), from the next one on
 
 static esp_err_t on_mic(httpd_req_t *req)
 {
@@ -611,12 +617,19 @@ static esp_err_t on_mic(httpd_req_t *req)
             if (want != settings.agc) { settings.agc = want; settings_save(); restart = true; }
             any = true;
         }
-        if (!any) return refuse(req, 400, "gain=0..37.5 and/or agc=on|off");
+        if (query_value(req, "max_s", text, sizeof text)) {
+            int n = atoi(text);
+            n = n < QUESTION_MAX_S_LEAST ? QUESTION_MAX_S_LEAST : n > QUESTION_MAX_S_MOST ? QUESTION_MAX_S_MOST : n;
+            if (n != settings.question_max_s) { settings.question_max_s = n; settings_save(); }
+            any = true;
+        }
+        if (!any) return refuse(req, 400, "gain=0..37.5, agc=on|off and/or max_s=5..60");
     }
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "gain_db", audio_mic_gain());
     cJSON_AddNumberToObject(j, "gain_max_db", MIC_GAIN_X2_MAX / 2.0);
     cJSON_AddBoolToObject(j, "agc", settings.agc);
+    cJSON_AddNumberToObject(j, "max_s", settings.question_max_s);
     if (restart) cJSON_AddStringToObject(j, "note", "restarting in 2 s: the AFE reads agc at start");
     esp_err_t r = say_json(req, 200, j);
     if (restart) { vTaskDelay(pdMS_TO_TICKS(2000)); esp_restart(); }
@@ -974,7 +987,7 @@ static esp_err_t on_screen(httpd_req_t *req)
     return say_json(req, 200, out);
 }
 
-// PUT /screen/settings {"brightness", "dim", "dim_after_s", "off_after_min"}: any of them; kept across a restart.
+// PUT /screen/settings {"brightness", "dim", "dim_after_s", "off_after_min", "flip"}: any of them; kept across a restart.
 // The backlight is the board's biggest draw that can be chosen: bright while in use, a glow or dark when left alone.
 static esp_err_t on_screen_settings(httpd_req_t *req)
 {
@@ -994,10 +1007,17 @@ static esp_err_t on_screen_settings(httpd_req_t *req)
         n = n < 0 ? 0 : n > fields[i].max ? fields[i].max : n;
         if (n != *fields[i].at) { *fields[i].at = n; changed = true; }
     }
+    const cJSON *flip = cJSON_GetObjectItem(in, "flip");       // 180 degrees, for a board mounted the other way up
+    if (cJSON_IsBool(flip) && cJSON_IsTrue(flip) != settings.flip) {
+        settings.flip = cJSON_IsTrue(flip);
+        board_glass_orient(settings.invert, settings.flip);
+        changed = true;
+    }
     cJSON_Delete(in);
     if (changed) { settings_save(); ui_relight(); }
     cJSON *j = cJSON_CreateObject();
     for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) cJSON_AddNumberToObject(j, fields[i].key, *fields[i].at);
+    cJSON_AddBoolToObject(j, "flip", settings.flip);
     return say_json(req, 200, j);
 }
 

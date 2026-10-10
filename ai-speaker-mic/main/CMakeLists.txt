@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS main.c settings.c console.c net.c server.c link.c light.c board.c audio.c wake.c storage.c ota.c stats.c lastwords.c ui.c lv_mem_psram.c camera.c mww.cc
+    SRCS main.c settings.c console.c net.c server.c link.c light.c board.c audio.c wake.c storage.c ota.c stats.c lastwords.c ui.c buttons.c lv_mem_psram.c camera.c mww.cc
     INCLUDE_DIRS .
     LDFRAGMENTS linker.lf
     EMBED_FILES ../models/hey_jarvis.tflite

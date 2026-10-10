@@ -1,7 +1,8 @@
 // link.h - the board's side of the three doors on Sapphire:
 //   POST /api/devices/<name>/wake     at the wake word: may this board take it?
 //   POST /api/devices/<name>/voice    what it heard, after its wake word
-//   GET  /api/devices/<name>/events   held open: what its light should show
+//   GET  /api/devices/<name>/events   held open: what its light should show, and what its buttons are set to
+//   POST /api/devices/<name>/press    a button set to send her a message was pressed
 // Sapphire is HTTPS with her own certificate. When the settings hold it, it
 // is the only one trusted. When they do not, the connection is not checked.
 #pragma once
@@ -17,3 +18,5 @@ bool link_send_voice(const int16_t *pcm, size_t samples, char *heard, size_t hea
 // Asks for the wake that just fired. False only when Sapphire said another
 // listener has it (`taken_by` names it); when she cannot be asked, true.
 bool link_claim_wake(char *taken_by, size_t size);
+// A press Sapphire set to reach her ("boot", "short"): queued, sent by its own task. Never blocks.
+void link_press(const char *button, const char *how);

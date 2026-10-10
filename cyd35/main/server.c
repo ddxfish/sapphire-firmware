@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 
 #include "board.h"
+#include "buttons.h"
 #include "light.h"
 #include "link.h"
 #include "net.h"
@@ -153,6 +154,8 @@ static esp_err_t on_health(httpd_req_t *req)
     if (speaker_ok()) cJSON_AddItemToArray(has, cJSON_CreateString("speaker"));
     if (storage_ok()) cJSON_AddItemToArray(has, cJSON_CreateString("storage"));
     cJSON_AddItemToArray(has, cJSON_CreateString("sensors"));
+    cJSON_AddItemToArray(has, cJSON_CreateString("buttons"));   // BOOT (0.4.0): what each press is set to comes on the events stream
+    cJSON_AddItemToObject(j, "buttons", buttons_json());
     if (ota_can()) cJSON_AddItemToArray(has, cJSON_CreateString("firmware"));   // two slots: PUT /firmware
     if (speaker_ok()) {
         cJSON *plays = cJSON_AddObjectToObject(j, "plays");
@@ -177,6 +180,7 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddNumberToObject(screen, "w", BOARD_W);
     cJSON_AddNumberToObject(screen, "h", BOARD_H);
     cJSON_AddStringToObject(screen, "format", "rgb565be");
+    cJSON_AddBoolToObject(screen, "flip", board()->flip);
     cJSON_AddItemToObject(j, "led", light_status());
     cJSON_AddNumberToObject(j, "uptime_s", esp_timer_get_time() / 1000000);
     cJSON *link = cJSON_AddObjectToObject(j, "link");
@@ -428,6 +432,28 @@ static void sleep_soon(void *arg)
     board_led(0, 0, 0);
     esp_sleep_enable_ext0_wakeup(BOARD_BOOT_BUTTON, 0);   // BOOT brings it back
     esp_deep_sleep_start();
+}
+
+// PUT /screen/settings {"flip": true|false}: the picture turned 180 degrees, kept. The board
+// restarts to draw that way; a card being written is left to finish first.
+static esp_err_t on_screen_settings(httpd_req_t *req)
+{
+    if (!let_in(req)) return ESP_OK;
+    cJSON *in = read_json(req);
+    if (!in) return ESP_OK;
+    const cJSON *flip = cJSON_GetObjectItem(in, "flip");
+    bool want = cJSON_IsTrue(flip);
+    bool turn = cJSON_IsBool(flip) && want != board()->flip;
+    cJSON_Delete(in);
+    if (turn && storage_busy()) return refuse(req, 409, "the card is being written: save again when it is done");
+    if (turn) {
+        board_set_flip(want);
+        xTaskCreate(restart_soon, "restart", 2048, NULL, 5, NULL);
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "flip", board()->flip);
+    cJSON_AddBoolToObject(j, "restarting", turn);
+    return say_json(req, 200, j);
 }
 
 static esp_err_t on_power(httpd_req_t *req)
@@ -764,6 +790,7 @@ void server_start(void)
         {"/led/baseline", HTTP_PUT, on_led_baseline, NULL},
         {"/led/looks", HTTP_PUT, on_led_looks, NULL},
         {"/screen", HTTP_POST, on_screen, NULL},
+        {"/screen/settings", HTTP_PUT, on_screen_settings, NULL},
         {"/screen/picture", HTTP_POST, on_picture, NULL},
         {"/power", HTTP_POST, on_power, NULL},
         {"/audio/speak", HTTP_POST, on_speak, NULL},

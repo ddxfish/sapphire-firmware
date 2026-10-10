@@ -1,7 +1,7 @@
 # Sapphire board firmware
 
 The programs for the small boards [Sapphire](https://github.com/ddxfish/sapphire)
-uses as devices: a voice box, a touchscreen, a USB stick with a screen. Each
+uses as devices: a voice box, a touchscreen, a USB stick that keeps her backups. Each
 speaks the [Satellite Protocol](https://github.com/ddxfish/sapphire/blob/main/docs/SATELLITE-PROTOCOL.md),
 so Sapphire shows only what a board says it has.
 
@@ -10,12 +10,12 @@ so Sapphire shows only what a board says it has.
 | `ai-speaker-mic/` | Waveshare ESP32-S3-AUDIO-Board: mics, speaker, light ring, optional screen and camera | works |
 | `cyd35/` | 3.5" Cheap Yellow Display, ESP32-3248S035C, capacitive touch (GT911) | works |
 | `cyd28/` | 2.8" Cheap Yellow Display, ESP32-2432S028R, resistive touch (XPT2046) | not started |
-| `tdongle/` | LilyGO T-Dongle-S3: small screen, one LED, one button | not started |
+| `tdongle/` | LilyGO T-Dongle-S3: a backup stick. A card for her backups, a small screen and an LED that say whether they are safe | works |
 
 ## Put it on a board
 
 You do not need this repository for that. In Sapphire: Settings > Devices >
-**+ Add Device** > **New board (USB)**. She downloads the board's files from
+**+ Add Board**. She downloads the board's files from
 this repository's release and writes them, from Chrome or Edge or from the
 computer she runs on.
 
@@ -59,7 +59,7 @@ esptool.py write_flash 0x0 cyd35-0.3.0.bin
 ```
 
 This also clears the board's saved name and WiFi, so it starts as a new
-board. Add it in Sapphire afterwards (**+ Add Device**).
+board. Set it up in Sapphire afterwards (**+ Add Board**).
 
 ## A new board
 
@@ -88,3 +88,9 @@ Not ours, and under their own terms:
   LVGL, TensorFlow Lite Micro and others): Apache 2.0 or MIT, each with its
   license in its folder. Two of Espressif's, `esp-sr` and `esp_new_jpeg`, are
   under the "Espressif MIT" license, which allows them on Espressif chips only.
+
+Additional permission under section 7 of the GNU AGPL v3: you may combine
+this code with Espressif's `esp-sr` and `esp_new_jpeg` components and convey
+the result, with those two components staying under their own license. If
+you change this code you may extend the permission to your version or leave
+it out. Only the `ai-speaker-mic` program contains either of them.

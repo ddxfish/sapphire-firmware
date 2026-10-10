@@ -45,6 +45,11 @@ typedef struct {
 bool board_init(int rate);             // I2C, expander (amplifier on), I2S, both codecs
 board_audio_t *board_audio(void);
 void board_amplifier(bool on);
+// The three keys (schematic 1.1, read 2026-10-10): Key1, Key2, Key3 on the
+// expander's EXIO9, 10, 11, each with 10K to 3V3 and pressed to ground. The
+// expander's interrupt line is not connected (R22 not fitted), so they are polled.
+#define BOARD_KEYS 3
+int board_keys(void);                  // bit 0..2 set = Key1..3 down; -1 = not known just now
 int board_i2c_scan(cJSON *list);       // the 7 bit addresses that answer, as numbers; -1 without a bus
 const char *board_trouble(void);       // "" or why board_init stopped, in words
 void board_i2c_counts(int *errors, int *resets, int *held);   // failed touch polls, touch rests, and the clock pulses SDA needed at boot

@@ -1,0 +1,6 @@
+## From Espressif's component registry. The panel is driven through ESP-IDF's own ST7789 object (board.c).
+dependencies:
+  idf: ">=5.5.3"
+  lvgl/lvgl: "^9.3"
+  espressif/esp_lvgl_port: "^2.6"
+  espressif/mdns: "^1.4.0"

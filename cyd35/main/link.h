@@ -1,8 +1,10 @@
 // link.h - what the board says to Sapphire, over HTTPS with its own key.
 //
 //   POST /api/devices/<name>/text          what was typed; answered once a turn starts
-//   GET  /api/devices/<name>/events        held open: her state for the light, and
-//                                          "text" doorbells: {msg, rev, have, done}
+//   POST /api/devices/<name>/press         a button set to send her a message was pressed
+//   GET  /api/devices/<name>/events        held open: her state for the light, what the
+//                                          buttons are set to, and "text" doorbells:
+//                                          {msg, rev, have, done}
 //   GET  /api/devices/<name>/text?msg=&rev=&from=&max=
 //                                          the words of her reply from `from` on
 //
@@ -20,4 +22,5 @@
 
 void link_start(void);
 bool link_send_text(const char *text);     // queued for the client task; false when there is no link
+void link_press(const char *button, const char *how);   // a press set to reach her: queued like typed text
 bool link_connected(void);                 // the events stream is open
