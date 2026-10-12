@@ -21,7 +21,9 @@
 #include "buttons.h"
 #include "light.h"
 #include "net.h"
+#include "server.h"
 #include "settings.h"
+#include "ui.h"
 #include "wake.h"
 #include "wav.h"
 
@@ -32,9 +34,10 @@ static int last_refusal;               // the events door's last status, said on
 #define CLAIM_WAIT_MS 3000             // the room is decided in a moment, or not at all
 #define EVENTS_QUIET_MS 45000          // a comment line arrives every 20 s
 #define EVENT_LINE 1024
+#define VOICE_ANSWER 8192              // the voice door's answer, with all she heard in it
 #define PRESS_WAIT_MS 15000            // answered once a turn has started
 
-typedef struct { char button[16], how[8]; } press_t;
+typedef struct { char button[16], how[8], job[16]; } press_t;   // job set: not a press, work asked of Sapphire (link_ask)
 static QueueHandle_t presses;
 
 static void url_for(const char *door, char *out, size_t size)
@@ -68,12 +71,15 @@ bool link_send_voice(const int16_t *pcm, size_t samples, char *heard, size_t hea
 {
     heard[0] = 0;
     if (!net_up()) { ESP_LOGW(TAG, "no WiFi: the question is lost"); return false; }
-    esp_http_client_handle_t c = open_client("voice", HTTP_METHOD_POST, VOICE_WAIT_MS);
+    // found within CLAIM_WAIT_MS x 3 or not at all; the long wait is for her answer. With one
+    // timeout for both, a host that was switched off held the board deaf for a minute and a half.
+    esp_http_client_handle_t c = open_client("voice", HTTP_METHOD_POST, CLAIM_WAIT_MS * 3);
     if (!c) return false;
     esp_http_client_set_header(c, "Content-Type", "audio/wav");
     size_t bytes = samples * 2;
     bool ok = false;
     if (esp_http_client_open(c, WAV_HEADER + bytes) == ESP_OK) {
+        esp_http_client_set_timeout_ms(c, VOICE_WAIT_MS);
         uint8_t head[WAV_HEADER];
         wav_header(head, AUDIO_RATE, 1, bytes);
         bool sent = esp_http_client_write(c, (char *)head, WAV_HEADER) == WAV_HEADER;
@@ -83,17 +89,20 @@ bool link_send_voice(const int16_t *pcm, size_t samples, char *heard, size_t hea
         }
         if (sent && esp_http_client_fetch_headers(c) >= 0) {
             int status = esp_http_client_get_status_code(c);
-            char body[EVENT_LINE] = {0};
-            int n = esp_http_client_read_response(c, body, sizeof body - 1);
+            // her answer carries every word she heard: a minute of talk is past 1 KB, and cut short
+            // it did not parse, so a question she took showed as an error (scout, 2026-10-11)
+            char *body = heap_caps_calloc(1, VOICE_ANSWER, MALLOC_CAP_SPIRAM);
+            int n = body ? esp_http_client_read_response(c, body, VOICE_ANSWER - 1) : 0;
             if (n > 0) body[n] = 0;
-            cJSON *j = cJSON_Parse(body);
+            cJSON *j = body ? cJSON_Parse(body) : NULL;
             cJSON *h = j ? cJSON_GetObjectItem(j, "heard") : NULL;
             cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
             if (cJSON_IsString(h)) strlcpy(heard, h->valuestring, heard_size);
             ok = status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"));
-            if (!ok) ESP_LOGW(TAG, "voice door answered %d: %s", status,
-                              cJSON_IsString(e) ? e->valuestring : body);
+            if (!ok) ESP_LOGW(TAG, "voice door answered %d: %.200s", status,
+                              cJSON_IsString(e) ? e->valuestring : body ? body : "");
             cJSON_Delete(j);
+            free(body);
         } else {
             ESP_LOGW(TAG, "the question did not reach Sapphire");
         }
@@ -165,11 +174,57 @@ static void send_press(const press_t *p)
     else if (!taken) light_cue("idle");          // nothing is set for it on her side: no turn, no cue will come
 }
 
+// --- work that is Sapphire's: POST .../ask {"job": "stop" | "backup"} -------------------
+// Her answer carries `said`, a line for a small screen. A stop says nothing when it went well.
+
+static void send_ask(const char *job)
+{
+    char out[48], body[384] = {0}, why[96] = "Sapphire did not answer";
+    int len = snprintf(out, sizeof out, "{\"job\": \"%s\"}", job);
+    bool ok = false;
+    esp_http_client_handle_t c = open_client("ask", HTTP_METHOD_POST, PRESS_WAIT_MS);
+    if (c) {
+        esp_http_client_set_header(c, "Content-Type", "application/json");
+        if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == len
+                && esp_http_client_fetch_headers(c) >= 0) {
+            int n = esp_http_client_read_response(c, body, sizeof body - 1);
+            if (n > 0) body[n] = 0;
+            int status = esp_http_client_get_status_code(c);
+            cJSON *j = cJSON_Parse(body);
+            const cJSON *said = j ? cJSON_GetObjectItem(j, "said") : NULL;
+            const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+            if (j && !e) e = cJSON_GetObjectItem(j, "detail");
+            ok = status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"));
+            if (ok && cJSON_IsString(said)) strlcpy(why, said->valuestring, sizeof why);
+            else if (cJSON_IsString(e)) strlcpy(why, e->valuestring, sizeof why);
+            else if (status == 404) strlcpy(why, "Sapphire is too old for this: update her", sizeof why);
+            else snprintf(why, sizeof why, "Sapphire answered %d", status);
+            cJSON_Delete(j);
+        }
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    ESP_LOGI(TAG, "asked for %s: %s", job, why);
+    if (!ok || strcmp(job, "stop")) ui_toast(why, ok ? 6 : 10);
+}
+
 static void press_task(void *arg)
 {
     press_t p;
     for (;;)
-        if (xQueueReceive(presses, &p, portMAX_DELAY) == pdTRUE) send_press(&p);
+        if (xQueueReceive(presses, &p, portMAX_DELAY) == pdTRUE) {
+            if (p.job[0]) send_ask(p.job);
+            else send_press(&p);
+        }
+}
+
+void link_ask(const char *job)
+{
+    press_t p = {0};
+    strlcpy(p.job, job, sizeof p.job);
+    if (!presses || !net_up() || xQueueSend(presses, &p, 0) != pdTRUE) {
+        if (strcmp(job, "stop")) ui_toast("No link to Sapphire", 6);      // a stop has already gone quiet here
+    }
 }
 
 void link_press(const char *button, const char *how)
@@ -202,11 +257,17 @@ static void take_line(const char *line)
                 settimeofday(&tv, NULL);
             }
             ESP_LOGI(TAG, "events stream open%s", cJSON_IsNumber(now) ? ", clock set" : "");
+            server_reply_over();                 // whatever was stopped here ended while the stream was away
             light_cue_from_brain("idle");
         }
         else if (!strcmp(state->valuestring, "standdown")) wake_standdown("Sapphire's own microphone");
         else if (!strcmp(state->valuestring, "buttons")) buttons_bound(cJSON_GetObjectItem(j, "bound"));
-        else light_cue_from_brain(state->valuestring);
+        else {
+            const char *s = state->valuestring;
+            if (!strcmp(s, "idle") || !strcmp(s, "error")) server_reply_over();   // her turn ended: a reply stopped here is done with
+            // a word this program does not know (a newer Sapphire's) is not a look: it was painted as one
+            if (!strcmp(s, "thinking") || !strcmp(s, "tool") || !strcmp(s, "idle") || !strcmp(s, "error")) light_cue_from_brain(s);
+        }
     }
     cJSON_Delete(j);
 }
@@ -260,6 +321,7 @@ static void events_task(void *arg)
     for (;;) {
         if (net_up()) {
             hold_events();
+            if (connected) pause = 1;                      // it had been open: back at once, not after the longest wait
             connected = false;
             light_cue("nolink");
             ESP_LOGD(TAG, "events: again in %d s", pause);

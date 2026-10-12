@@ -10,6 +10,7 @@
 #include "esp_heap_caps.h"
 #include "esp_spiffs.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -19,6 +20,7 @@
 #include "light.h"
 #include "link.h"
 #include "mww.h"
+#include "server.h"
 #include "settings.h"
 #include "ui.h"
 
@@ -29,6 +31,10 @@ static const char *TAG = "wake";
 #define PREROLL_MS 250                 // the moment before the wake word ended, kept
 #define NO_SPEECH_MS 4000              // woke, and nobody said anything
 #define QUIET_END_MS 700               // silence after speech that ends the question
+#define OVER_HER_MS 600                // said over her: this long her own last syllables are not taken for the question
+#define NO_SPEECH_OVER_HER_MS 8000     // ... and the person gets twice as long to begin: she has only just gone quiet
+#define TAP_MS 400                     // begun by a tap or a key: the knock of the finger is not the question
+#define REAL_SPEECH_MS 200             // less speech than this in all is a knock, a click, a door: the question has not begun
 #define PREROLL (AUDIO_RATE * PREROLL_MS / 1000)
 #define MAX_SAMPLES ((size_t)AUDIO_RATE * MAX_RECORD_S)
 
@@ -92,7 +98,8 @@ static bool load_stored(mww_config_t *cfg)
     int step = (j && cJSON_IsNumber(v = cJSON_GetObjectItem(j, "step_ms"))) ? v->valueint : 10;
     cJSON_Delete(j);
     cfg->model = stored; cfg->model_size = stored_size; cfg->probability_cutoff = stored_threshold;
-    cfg->sliding_window_size = window < 1 ? 5 : window; cfg->feature_step_ms = step < 1 ? 10 : step;
+    cfg->sliding_window_size = window < 1 || window > 50 ? 5 : window;
+    cfg->feature_step_ms = step < 5 || step > 30 ? 10 : step;       // past the 30 ms window the front end's maths wraps and the board falls over
     cfg->tensor_arena_size = STORED_ARENA;
     return true;
 }
@@ -100,8 +107,12 @@ static bool load_stored(mww_config_t *cfg)
 typedef enum { IDLE, RECORDING, SENDING } state_t;
 
 static bool enabled = true;
+#define MODEL_MAGIC 0x6d6f6431
+static RTC_NOINIT_ATTR uint32_t model_magic, model_falls;   // starts in a row that loaded the stored model and then fell
+static volatile bool paused;            // a backup is landing: the board's own pause, never the person's switch
 static volatile bool forget;            // the model is to be reset, by the task that feeds it
 static bool running;
+static bool ready;                      // wake_start got to its end: the recording buffer and a model are there
 static state_t state;
 static bool for_listen;                // the recording is for /audio/listen, not the wake word
 static bool plain;                     // /audio/listen?vad=false: the room for max_s seconds, no speech rules
@@ -111,6 +122,9 @@ static size_t limit;
 static int16_t ring[PREROLL];
 static size_t ring_at;
 static bool speech_seen;
+static int64_t deaf_until;             // ms: speech before this is her voice dying away or a finger's knock, not the person's
+static int speech_ms;                  // how much speech this recording has had
+static int no_speech_ms;               // woke, and nobody said anything for this long: over
 static int64_t began_us, last_speech_us;
 static SemaphoreHandle_t done;         // given when a recording ends
 static SemaphoreHandle_t send_now;
@@ -121,9 +135,17 @@ static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 static void begin(bool listen, size_t max_samples)
 {
-    // the moment before the wake word ended is kept, so a fast talker is not cut
+    // Said over her (0.7.1): she stops, and the question starts clean, without
+    // her own voice in front of it. Sapphire drops the rest of that reply when
+    // the wake is claimed. Else the moment before the wake word ended is kept,
+    // so a fast talker is not cut.
     have = 0;
-    for (size_t i = 0; i < PREROLL; i++) buf[have++] = ring[(ring_at + i) % PREROLL];
+    bool over_her = !listen && (server_talking() || light_turn_on());
+    deaf_until = over_her ? now_ms() + OVER_HER_MS : 0;
+    no_speech_ms = over_her ? NO_SPEECH_OVER_HER_MS : NO_SPEECH_MS;
+    speech_ms = 0;
+    if (over_her) server_stop_speech();
+    else for (size_t i = 0; i < PREROLL; i++) buf[have++] = ring[(ring_at + i) % PREROLL];
     limit = max_samples > MAX_SAMPLES ? MAX_SAMPLES : max_samples;
     speech_seen = false;
     began_us = last_speech_us = now_ms();
@@ -138,8 +160,9 @@ void wake_standdown(const char *who)
 {
     if (state != RECORDING || for_listen) return;
     ESP_LOGI(TAG, "standing down: the room is %s's", who && who[0] ? who : "another's");
+    server_reply_over();
     state = IDLE;                                     // on_audio stops filling the buffer
-    mww_reset();
+    forget = true;                                    // reset by the task that feeds the model, never under it
     light_cue("idle");
 }
 
@@ -153,6 +176,7 @@ static void end(bool spoke)
     }
     if (!spoke) {
         ESP_LOGI(TAG, "woke, heard nothing");
+        server_reply_over();
         state = IDLE;
         light_cue("idle");
         return;
@@ -170,7 +194,7 @@ static void on_audio(const int16_t *pcm, size_t samples, bool speech)
     }
     if (state == IDLE) {
         if (forget) { forget = false; mww_reset(); }
-        if (enabled && mww_feed(pcm, samples)) {
+        if (enabled && !paused && mww_feed(pcm, samples)) {
             ESP_LOGI(TAG, "wake word");
             begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
         }
@@ -185,10 +209,15 @@ static void on_audio(const int16_t *pcm, size_t samples, bool speech)
         if (have >= limit) end(true);
         return;
     }
-    if (speech) { speech_seen = true; last_speech_us = t; }
+    // A tap on the glass was heard as speech, then 700 ms of quiet ended the
+    // question before a word was said (1.2 s sent, 2026-10-11).
+    if (speech && t >= deaf_until) {
+        speech_ms += (int)(samples * 1000 / AUDIO_RATE);
+        if (speech_ms >= REAL_SPEECH_MS) { speech_seen = true; last_speech_us = t; }
+    }
     if (have >= limit) end(speech_seen);
     else if (speech_seen && t - last_speech_us > QUIET_END_MS) end(true);
-    else if (!speech_seen && t - began_us > NO_SPEECH_MS) end(false);
+    else if (!speech_seen && t - began_us > no_speech_ms) end(false);
 }
 
 static void send_task(void *arg)
@@ -199,11 +228,15 @@ static void send_task(void *arg)
         ESP_LOGI(TAG, "sending %.1f s", have / (float)AUDIO_RATE);
         bool ok = link_send_voice(buf, have, heard, sizeof heard);
         if (ok) ESP_LOGI(TAG, "she heard: %s", heard[0] ? heard : "(nothing)");
-        if (ok && heard[0]) ui_heard(heard);
-        else light_cue("error");
-        if (ok && !heard[0]) light_cue("idle");   // silence: no turn, so no cue will come
+        // Free to hear her before the glass is asked anything: its lock can take
+        // half a second, and a first sentence met in that time was refused.
         mww_reset();
+        server_reply_over();                      // what she says now is the answer to this
         state = IDLE;
+        if (!ok) light_cue("error");
+        else if (!heard[0]) light_cue("idle");    // silence: no turn, so no cue will come
+        else light_settle();                      // her cues came while this was still sending: show the last one
+        if (ok && heard[0]) ui_heard(heard);
     }
 }
 
@@ -228,7 +261,17 @@ void wake_start(void)
         .probability_cutoff = 0.97f, .sliding_window_size = 5, .tensor_arena_size = 22860,
         .feature_step_ms = 10,
     };
-    bool have_stored = load_stored(&cfg);
+    // A stored model that brings the board down does so at every start, before WiFi, where
+    // nothing can take it away. Two falls in a row with it loaded and it is left out this
+    // time (not deleted): the board comes up on the embedded one and can be sent another.
+    esp_reset_reason_t why = esp_reset_reason();
+    bool fell = why == ESP_RST_PANIC || why == ESP_RST_INT_WDT || why == ESP_RST_TASK_WDT || why == ESP_RST_WDT;
+    if (model_magic != MODEL_MAGIC || !fell) { model_magic = MODEL_MAGIC; model_falls = 0; }
+    bool distrusted = model_falls >= 2;
+    if (distrusted) ESP_LOGE(TAG, "the stored model was loaded at the last two starts and both fell: left out this time");
+    bool have_stored = !distrusted && load_stored(&cfg);
+    if (have_stored) model_falls++;
+    else model_falls = 0;
     if (have_stored && !mww_init(&cfg)) {
         ESP_LOGE(TAG, "the stored model '%s' did not load; back to the embedded one", stored_name);
         stored_name[0] = 0;
@@ -237,8 +280,10 @@ void wake_start(void)
         have_stored = false;
     }
     if (!have_stored && !mww_init(&cfg)) { ESP_LOGE(TAG, "the wake word model did not load"); return; }
+    enabled = !settings.wake_off;
     running = audio_ok();
     audio_set_sink(on_audio);
+    ready = true;
     task_in_psram(send_task, "wake-send", 8192, 5, 0);     // stacks in PSRAM, TCBs internal; no flash writes on them
     task_in_psram(claim_task, "wake-claim", 8192, 5, 0);
     ESP_LOGI(TAG, "listening for '%s' (%s)", wake_model_name(), stored_name[0] ? "stored" : "embedded");
@@ -247,11 +292,22 @@ void wake_start(void)
 bool wake_enabled(void) { return enabled; }
 void wake_trigger(void)
 {
-    if (!audio_ok() || state != IDLE) return;
+    if (!ready || !audio_ok() || state != IDLE) return;
+    if (paused) { ui_toast("Backup in progress", 3); return; }
     ESP_LOGI(TAG, "listening by hand");
     begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
+    if (!deaf_until) deaf_until = now_ms() + TAP_MS;
 }
-void wake_enable(bool on) { enabled = on; if (!on) forget = true; }   // called from the glass's task and the server's: never the model itself
+void wake_enable(bool on)
+{
+    enabled = on;
+    if (!on) forget = true;
+    if (settings.wake_off == on) { settings.wake_off = !on; settings_save_soon(); }   // turned off stays off across a restart, as the ring does
+}   // called from the glass's task and the server's: never the model itself
+// While a backup lands the board hears no wake word and takes no question: the transfer fills the WiFi
+// buffers her question's TLS session needs, and a wake then went nowhere (2026-10-10). Five minutes a night.
+void wake_pause(bool on) { paused = on; if (on) forget = true; }
+bool wake_paused(void) { return paused; }
 bool wake_running(void) { return running && audio_ok(); }
 bool wake_busy(void) { return state != IDLE; }
 const char *wake_model_name(void) { return stored_name[0] ? stored_name : MODEL_NAME; }
@@ -306,11 +362,18 @@ bool wake_model_forget(void)
 
 bool wake_record_now(int max_s, bool use_vad, recording_t *out)
 {
-    if (!audio_ok() || state != IDLE) return false;
+    if (!ready || !audio_ok() || state != IDLE) return false;
     xSemaphoreTake(done, 0);
     begin(true, (size_t)AUDIO_RATE * max_s);
     plain = !use_vad;
-    xSemaphoreTake(done, portMAX_DELAY);
+    // Only the sound coming in ends a recording. If it has stopped, this wait was for ever, on
+    // the web server's one task: the board was gone until a restart (scouts, 2026-10-11).
+    if (xSemaphoreTake(done, pdMS_TO_TICKS((max_s + 5) * 1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "a recording did not end: no sound is coming in");
+        state = IDLE;
+        light_cue("error");
+        return false;
+    }
     out->pcm = buf;
     out->samples = ended_by_speech ? have : 0;
     return true;

@@ -20,3 +20,4 @@ bool link_send_voice(const int16_t *pcm, size_t samples, char *heard, size_t hea
 bool link_claim_wake(char *taken_by, size_t size);
 // A press Sapphire set to reach her ("boot", "short"): queued, sent by its own task. Never blocks.
 void link_press(const char *button, const char *how);
+void link_ask(const char *job);         // work that is Sapphire's, from any task: "stop" (she was stopped here), "backup" (onto this board's card, now)

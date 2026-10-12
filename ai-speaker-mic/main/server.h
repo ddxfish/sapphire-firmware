@@ -23,4 +23,7 @@
 
 void server_start(void);
 bool server_speaking(void);           // a sentence is playing now
-bool server_stop_speech(void);        // cut it and refuse the rest of that reply for a moment; true if something played
+bool server_talking(void);            // a reply is being spoken: a sentence plays, waits, or ended a moment ago
+bool server_stop_speech(void);        // a stop made on the board: cut it, and answer "stopped" to the rest of that reply; true if something played
+bool server_stop_by_hand(void);        // the same from a tap or a button, and Sapphire is told: her turn ends
+void server_reply_over(void);         // that reply is over (her turn ended, or a question went to her): sentences play again

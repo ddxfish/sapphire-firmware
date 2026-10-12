@@ -138,14 +138,19 @@ void audio_set_volume(int level)
 {
     level = level < 0 ? 0 : level > 100 ? 100 : level;
     settings.volume = level;
-    settings_save();
+    settings_save_soon();                  // the glass's slider and the volume keys call this from PSRAM stacks
     if (ok) esp_codec_dev_set_out_vol(board_audio()->out, level);
 }
 
 int audio_volume(void) { return settings.volume; }
 
 static bool muted;
-void audio_set_mute(bool on) { muted = on; board_amplifier(!on); }
+void audio_set_mute(bool on)
+{
+    muted = on;
+    board_amplifier(!on);
+    if (settings.mute != on) { settings.mute = on; settings_save_soon(); }   // kept across a restart
+}
 bool audio_muted(void) { return muted; }
 void audio_set_sink(audio_sink_fn fn) { sink = fn; }
 

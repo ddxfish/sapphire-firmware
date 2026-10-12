@@ -40,7 +40,7 @@ static const char *TAG = "storage";
 #define WRITE_CHUNK BOARD_STORAGE_CHUNK
 
 #define HASH_END ".sha256"             // beside each backup, when the board keeps hashes: 64 hex characters
-#define DAMAGED_MAX 8
+#define DAMAGED_MAX 16                 // every backup Sapphire keeps on one card by default (7 + 4 + 3), and two more
 #define BUSY_WAIT_MS 10000             // a write waits this long for the check to step aside
 
 static sdmmc_card_t *card;
@@ -135,7 +135,9 @@ int storage_checked(const char *name)
 static bool take_busy(void)
 {
     step_aside = true;
-    bool got = xSemaphoreTake(busy, check_holds ? pdMS_TO_TICKS(BUSY_WAIT_MS) : 0) == pdTRUE;
+    // while a check runs at all, not only once it says it holds the card: between its taking
+    // the card and saying so a writer saw "busy" and gave up, and that night's backup was lost
+    bool got = xSemaphoreTake(busy, check_holds || state.checking ? pdMS_TO_TICKS(BUSY_WAIT_MS) : 0) == pdTRUE;
     step_aside = false;
     return got;
 }
@@ -217,9 +219,12 @@ static void check_task(void *arg)
         struct stat st;
         bool there = !stat(path, &st), again = false;
         if (there && have == 64) {
-            if (hash_file(path, got, true)) {
+            bool read = hash_file(path, got, true);
+            if (!read && !step_aside) read = hash_file(path, got, true);   // the card stumbled: once more before it is called lost
+            if (read) {
                 if (strcmp(got, want)) { mark_damaged(names[i]); bad++; ESP_LOGE(TAG, "%s is DAMAGED: it no longer matches its hash", names[i]); }
-            } else again = step_aside;                       // a writer came: this one once more, after it
+            } else if (step_aside) again = true;             // a writer came: this one once more, after it
+            else { mark_damaged(names[i]); bad++; ESP_LOGE(TAG, "%s is DAMAGED: the card could not read it back, twice", names[i]); }   // unreadable is not fine
         }
         check_holds = false;
         xSemaphoreGive(busy);
@@ -328,6 +333,29 @@ bool storage_start(void)
 }
 
 bool storage_ok(void) { return mounted; }
+
+// The card looked at before it is used, from the web server's task: one
+// status command. A card that was pulled (to read a backup on a computer) and
+// put back answers nothing until it is mounted again, and nothing did that:
+// every backup after it failed until the board was restarted. A card that is
+// not there now is tried again here, each time.
+bool storage_alive(void)
+{
+    if (!busy) busy = xSemaphoreCreateMutex();
+    if (!mounted) return storage_start();
+    if (xSemaphoreTake(busy, 0) != pdTRUE) return true;     // in use this moment: it is there
+    bool gone = sdmmc_get_status(card) != ESP_OK;
+    if (gone) {
+        ESP_LOGW(TAG, "the card does not answer: taken out? mounting it again");
+        esp_vfs_fat_sdcard_unmount(MOUNT, card);
+        card = NULL;
+        mounted = false;
+        memset(damaged, 0, sizeof damaged);
+    }
+    xSemaphoreGive(busy);
+    if (gone) { rescan(); return storage_start(); }
+    return true;
+}
 
 const char *storage_dir(void) { return FOLDER; }
 

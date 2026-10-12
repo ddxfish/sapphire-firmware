@@ -17,6 +17,8 @@ void wake_start(void);
 void wake_standdown(const char *who);
 bool wake_enabled(void);
 void wake_enable(bool on);
+void wake_pause(bool on);              // a backup is landing: no wake word, no question by hand, until false
+bool wake_paused(void);
 void wake_trigger(void);               // as if the word was heard, even with the wake word off: the glass's middle
 bool wake_running(void);               // the model is loaded and audio flows
 bool wake_busy(void);                  // a question is being recorded or sent: the card transfer waits

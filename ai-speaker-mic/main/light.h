@@ -6,8 +6,11 @@
 //   bpm       beats (or turns) a minute        floor, ceiling  brightness 0..1
 //
 // What shows, first wins:
-//   1. a state of the board: listening, thinking, tool, speaking, error, nolink
-//   2. what she set with /led (held for a time, or "off" until cleared)
+//   0. turned off (the corner, a key, her "off"): dark through everything below
+//      but the camera's warning, until turned on. Kept across a restart.
+//   1. a state of the board: listening, thinking, tool, speaking, error, nolink,
+//      then a backup landing on the card (a soft orange pulse)
+//   2. what she set with /led (held for a time)
 //   3. the resting look, or outside the active hours the night look (off = dark)
 // The looks for each state, the night look and the hours come from Settings >
 // Devices through PUT /led/looks, and are kept in flash. The Pi's ring speaks
@@ -38,6 +41,9 @@ extern const look_t LIGHT_PLAIN;                   // what a "set" starts from
 void light_start(void);
 void light_cue(const char *state);                 // listening, thinking, tool, speaking, error, camera, idle, nolink, off
 void light_cue_from_brain(const char *state);      // the events stream: remembered, painted unless sound plays
+void light_camera_done(void);                      // after a shot: the camera's warning is let go
+void light_settle(void);                           // after a question is sent: her cues that came meanwhile
+bool light_turn_on(void);                          // her turn is going on: the brain's last cue was thinking or tool
 void light_speech_done(void);                      // after /audio/speak: the brain's cue if its turn goes on, else idle
 void light_show(int r, int g, int b, int seconds); // one plain color on every light, for a check
 
@@ -57,6 +63,7 @@ const char *light_cue_now(void);                                        // the c
 void light_current(uint8_t *r, uint8_t *g, uint8_t *b);                 // the ring's color this frame, averaged: the glass mirrors it
 bool light_is_dark(void);                                               // off until cleared
 void light_toggle_dark(void);                                           // the glass's ring corner
+void light_backup(bool on);                                             // a backup is landing on the card
 cJSON *light_spec(void);                                                // for /led/spec
 bool light_save(void);                                                  // looks and hours to flash
 void light_load(void);

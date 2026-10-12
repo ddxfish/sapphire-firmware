@@ -62,6 +62,7 @@ void board_i2c_counts(int *errors, int *resets, int *held);   // failed touch po
 #define BOARD_SD_CLK 40
 #define BOARD_SD_CMD 42
 #define BOARD_SD_D0 41
+#define BOARD_STORAGE_CHECKS           // storage.c: read every backup back, keep its hash, check them all at start (0.7.0)
 bool board_sd_select(bool high);       // D3/CS through the expander; false when the expander is not up
 
 // --- the glass (0.4.0): Waveshare's 2inch Capacitive Touch LCD on the 18 pin plug ---

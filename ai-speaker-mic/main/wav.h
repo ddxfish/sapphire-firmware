@@ -42,6 +42,7 @@ static inline int wav_parse(const uint8_t *p, size_t have, wav_info_t *out)
             out->data_at = at + 8;
             return fmt && out->bits == 16 && out->channels >= 1 && out->channels <= 2;
         }
+        if (size > have - at - 8) return 0;              // a chunk that runs past what is here (a size near 4 GB made `at` stand still, for ever)
         at += 8 + size + (size & 1);
     }
     return 0;

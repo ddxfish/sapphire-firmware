@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -44,6 +45,9 @@ void settings_load(void)
     settings.dim_percent = DIM_PERCENT_DEFAULT;
     settings.dim_after_s = DIM_AFTER_S_DEFAULT;
     settings.off_after_min = 0;
+    settings.ring = 100;
+    settings.ring_off = false;
+    settings.vol_step = VOL_STEP_DEFAULT;
     nvs_handle_t h;
     if (nvs_open("sat", NVS_READONLY, &h) != ESP_OK) {
         ESP_LOGI(TAG, "no settings yet: waiting to be set up over USB");
@@ -67,6 +71,11 @@ void settings_load(void)
     if (nvs_get_u8(h, "dim", &v8) == ESP_OK && v8 <= 100) settings.dim_percent = v8;
     if (nvs_get_u16(h, "dim_after", &v16) == ESP_OK) settings.dim_after_s = v16;
     if (nvs_get_u16(h, "off_after", &v16) == ESP_OK) settings.off_after_min = v16;
+    if (nvs_get_u8(h, "ring", &v8) == ESP_OK && v8 >= RING_LEAST && v8 <= 100) settings.ring = v8;
+    if (nvs_get_u8(h, "ring_off", &v8) == ESP_OK) settings.ring_off = v8 != 0;
+    if (nvs_get_u8(h, "vol_step", &v8) == ESP_OK && v8 >= 1 && v8 <= 50) settings.vol_step = v8;
+    if (nvs_get_u8(h, "wake_off", &v8) == ESP_OK) settings.wake_off = v8 != 0;
+    if (nvs_get_u8(h, "mute", &v8) == ESP_OK) settings.mute = v8 != 0;
     nvs_close(h);
     if (!settings.name[0]) strcpy(settings.name, "satellite");
 }
@@ -88,10 +97,33 @@ bool settings_save(void)
     ok = ok && nvs_set_u8(h, "dim", settings.dim_percent) == ESP_OK;
     ok = ok && nvs_set_u16(h, "dim_after", settings.dim_after_s) == ESP_OK;
     ok = ok && nvs_set_u16(h, "off_after", settings.off_after_min) == ESP_OK;
+    ok = ok && nvs_set_u8(h, "ring", settings.ring) == ESP_OK;
+    ok = ok && nvs_set_u8(h, "ring_off", settings.ring_off ? 1 : 0) == ESP_OK;
+    ok = ok && nvs_set_u8(h, "vol_step", settings.vol_step) == ESP_OK;
+    ok = ok && nvs_set_u8(h, "wake_off", settings.wake_off ? 1 : 0) == ESP_OK;
+    ok = ok && nvs_set_u8(h, "mute", settings.mute ? 1 : 0) == ESP_OK;
     ok = ok && nvs_commit(h) == ESP_OK;
     nvs_close(h);
     return ok;
 }
+
+// A slider on the glass and a volume key change a setting from tasks whose
+// stacks are in PSRAM, and flash is written with the cache off: they ask here,
+// and the watch task (internal stack) writes once the changes have stopped.
+#define SAVE_AFTER_US 2000000
+static volatile int64_t save_at_us;
+
+void settings_save_soon(void) { save_at_us = esp_timer_get_time() + SAVE_AFTER_US; }
+
+void settings_tick(void)
+{
+    int64_t at = save_at_us;
+    if (!at || esp_timer_get_time() < at) return;
+    save_at_us = 0;
+    if (!settings_save()) ESP_LOGW(TAG, "flash refused the settings");
+}
+
+void settings_flush(void) { if (save_at_us) { save_at_us = 0; settings_save(); } }
 
 void settings_erase(void)
 {
@@ -113,6 +145,9 @@ void settings_erase(void)
     settings.dim_percent = DIM_PERCENT_DEFAULT;
     settings.dim_after_s = DIM_AFTER_S_DEFAULT;
     settings.off_after_min = 0;
+    settings.ring = 100;
+    settings.ring_off = false;
+    settings.vol_step = VOL_STEP_DEFAULT;
 }
 
 bool settings_ready(void)

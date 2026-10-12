@@ -138,7 +138,7 @@ bool camera_snap(int w, int h, snap_t *out, char *why, size_t why_len)
         if (fb) esp_camera_fb_return(fb);
         down();
     }
-    light_speech_done();                            // back to the brain's cue, or idle
+    light_camera_done();                            // back to the brain's cue, or idle
     busy = false;
     xSemaphoreGive(lock);
     if (ok) ESP_LOGI(TAG, "snap %dx%d, %u bytes", out->w, out->h, (unsigned)out->len);

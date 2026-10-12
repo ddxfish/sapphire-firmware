@@ -73,6 +73,7 @@ static void watch_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (ui_beat_age_ms() > GLASS_STUCK_S * 1000) lastwords_die("the glass stopped for 10 s");
+        settings_tick();                 // this stack is internal: what a slider or a key changed is written to flash here
     }
 }
 
@@ -80,29 +81,46 @@ static void watch_task(void *arg)
 
 static void job_listen(void)
 {
-    if (server_speaking()) server_stop_speech();
+    if (server_talking() || light_turn_on()) server_stop_by_hand();  // while her turn goes on a press only ever stops her
     else wake_trigger();
 }
+static void job_stop(void) { if (server_talking() || light_turn_on()) server_stop_by_hand(); }  // nothing to stop: nothing is refused
+static void job_backup(void) { link_ask("backup"); }           // Sapphire makes it and sends it here; her answer shows on the glass
 static void job_light(void) { light_toggle_dark(); }
 static void job_screen(void) { ui_screen_power(!ui_screen_on()); }
 static void job_wake(void) { wake_enable(!wake_enabled()); }
 static void job_mute(void) { audio_set_mute(!audio_muted()); }
+static void volume_by(int step)
+{
+    audio_set_volume(audio_volume() + step);
+    char text[24];
+    snprintf(text, sizeof text, "Volume %d%%", audio_volume());
+    ui_toast(text, 2);
+}
+static void job_louder(void) { volume_by(settings.vol_step); }
+static void job_quieter(void) { volume_by(-settings.vol_step); }
 
 static const button_job_t JOBS[] = {
     {"listen", "Listen now, or stop her while she speaks", job_listen},
+    {"stop", "Stop her speaking", job_stop},
+    {"backup", "Back up to this board now", job_backup},
     {"light", "Ring on or off", job_light},
     {"screen", "Screen on or off", job_screen},
     {"wake", "Wake word on or off", job_wake},
     {"mute", "Speaker on or off", job_mute},
+    {"louder", "Volume up a step", job_louder},
+    {"quieter", "Volume down a step", job_quieter},
 };
 // BOOT, the three keys on the expander, then the glass's four corners (ui.c taps them by name).
-// Left alone, the keys do what the corners do, for a board with no glass.
+// Left alone, the real buttons are a remote for a board with no glass: volume at the two ends
+// (BOOT down, Key3 up), Key1 listens or stops her, Key2 is the ring, held the wake word, twice
+// the speaker (Krem's own set after a day of use, 2026-10-11).
 #define FIRST_KEY 1
 static const button_def_t BUTTONS[] = {
-    {"boot", BOARD_BOOT_BUTTON, {"listen", NULL, NULL}},
-    {"key1", BUTTON_FED, {"wake", NULL, NULL}},
-    {"key2", BUTTON_FED, {"mute", NULL, NULL}},
-    {"key3", BUTTON_FED, {"light", NULL, NULL}},
+    {"boot", BOARD_BOOT_BUTTON, {"quieter", NULL, NULL}},
+    {"key1", BUTTON_FED, {"listen", NULL, NULL}},
+    {"key2", BUTTON_FED, {"light", "wake", "mute"}},
+    {"key3", BUTTON_FED, {"louder", NULL, NULL}},
     {"top-left", BUTTON_TAP, {"light", NULL, NULL}},
     {"top-right", BUTTON_TAP, {"screen", NULL, NULL}},
     {"bottom-left", BUTTON_TAP, {"wake", NULL, NULL}},
@@ -138,16 +156,19 @@ void app_main(void)
     board_init(AUDIO_RATE);
     if (lastwords_strikes() >= 3) ESP_LOGE(TAG, "the glass stopped three starts in a row: left off this time");
     else if (board_glass_init()) ui_start();   // the glass (0.4.0): the panel on SPI2, the touch chip on the shared bus
-    xTaskCreatePinnedToCore(watch_task, "watch", 3072, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(watch_task, "watch", 4096, NULL, 6, NULL, 1);   // 4 KB: it writes the settings to flash too
     camera_start();                    // the eye (0.5.0): woken once to say who it is, then powered down
     room("after glass and camera");
+    // before WiFi: what Sapphire set the presses to arrives the moment her stream opens, and
+    // with no buttons known yet it was dropped (certain on a first start, the model store's format takes 20 s)
+    buttons_setup(BUTTONS, ui_ok() ? 8 : FIRST_KEY + BOARD_KEYS, JOBS, sizeof JOBS / sizeof JOBS[0]);   // no glass, no corners
     if (settings_ready()) net_start(on_network_up);
     room("after WiFi");
     audio_start();
     wake_start();
     room("after sound");
     storage_start();                   // the card: its CS line is on the expander
-    buttons_setup(BUTTONS, ui_ok() ? 8 : FIRST_KEY + BOARD_KEYS, JOBS, sizeof JOBS / sizeof JOBS[0]);   // no glass, no corners
+    if (settings.mute) audio_set_mute(true);            // as it was left
     task_in_psram(buttons_task, "buttons", 4096, 4, 1);   // its jobs flip flags and never write flash
     room("after card");
     if (!settings_ready()) {

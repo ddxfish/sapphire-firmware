@@ -40,7 +40,8 @@ void ui_status(const char *text);                 // the top line's right side; 
 // `seconds` or a tap. NULL when the glass is busy or out of memory.
 uint8_t *ui_image_begin(int kind, int w, int h);
 bool ui_image_show(int kind, int w, int h, int seconds, const char *name);
-bool ui_image_drop(int kind);                     // begin without show, or clear
+bool ui_image_drop(int kind);
+bool ui_image_abort(int kind);                    // from the one filling it: its upload broke off                     // begin without show, or clear
 const char *ui_scene_name(void);                  // "" = none
 bool ui_picture_on(void);
 bool ui_screen_power(bool on);                    // backlight; a touch turns it back on

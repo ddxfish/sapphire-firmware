@@ -23,6 +23,7 @@
 #include "net.h"
 #include "server.h"
 #include "settings.h"
+#include "storage.h"
 #include "wake.h"
 
 static const char *TAG = "ui";
@@ -37,9 +38,11 @@ static bool ok;
 static lv_obj_t *scene, *picture, *catcher, *chat_lbl, *clock_lbl, *heard, *toast, *halo, *glow, *state_lbl;
 static lv_obj_t *zone[4], *zone_btn[4], *zone_lbl[4];
 static lv_obj_t *status_card, *status_text_lbl;
+static lv_obj_t *dial_card, *dial_lbl;
+static int dial_kind;
 static void status_fill(void);
 static lv_timer_t *tick, *heard_timer, *toast_timer, *picture_timer;
-static char status_text[48], scene_name[48], chat_name[32], brain_name[48];
+static char status_text[48], scene_name[64], chat_name[32], brain_name[48];   // a scene's name is 50 at most: cut short, Sapphire took it for another and sent it again and again
 static int trim = -1;                  // the chat's trim color as 0xRRGGBB, -1 = none: the middle wears it while she rests
 static bool screen_on = true, dimmed, asleep;   // dimmed and asleep come by themselves (settings) and go at a touch or when she stirs; screen_on is the corner button
 static char last_cue[16];
@@ -126,10 +129,80 @@ static void on_zone(lv_event_t *e)
     buttons_tap(CORNER[(int)(intptr_t)lv_event_get_user_data(e)]);
 }
 
+// --- the dial: a corner held down opens the slider of what that corner does ------------
+// The speaker's corner: volume. The screen's: its brightness. The ring's: how bright
+// the ring is painted. One card, one slider; a tap beside the slider closes it. Built
+// when asked for and deleted when left, like the status page.
+
+enum { DIAL_VOLUME, DIAL_SCREEN, DIAL_RING };
+static const char *DIAL_NAME[] = {"Volume", "Screen", "Ring"};
+
+static void on_dial_close(lv_event_t *e)
+{
+    if (tap_taken()) return;                   // the glass had gone dark under it: this tap only brings it back
+    lv_obj_delete(dial_card);
+    dial_card = NULL;
+}
+
+// On this task, whose stack is in PSRAM: nothing here writes flash (settings_save_soon).
+static void on_dial(lv_event_t *e)
+{
+    int v = lv_slider_get_value(lv_event_get_target(e));
+    if (dial_kind == DIAL_VOLUME) audio_set_volume(v);
+    else if (dial_kind == DIAL_SCREEN) { settings.brightness = v; board_backlight(v); settings_save_soon(); }
+    else {
+        settings.ring = v;
+        settings_save_soon();
+        if (!light_is_dark()) light_hold(&LIGHT_PLAIN, 3);     // seen while it is set, whatever the hour
+    }
+    lv_label_set_text_fmt(dial_lbl, "%s  %d%%", DIAL_NAME[dial_kind], v);
+}
+
+static void on_zone_held(lv_event_t *e)
+{
+    if (tap_taken() || dial_card) return;
+    char job[BUTTON_JOB];
+    if (!buttons_does(CORNER[(int)(intptr_t)lv_event_get_user_data(e)], PRESS_SHORT, job, sizeof job)) return;
+    int least = 0, now;
+    if (!strcmp(job, "mute") || !strcmp(job, "louder") || !strcmp(job, "quieter")) { dial_kind = DIAL_VOLUME; now = audio_volume(); }
+    else if (!strcmp(job, "screen")) { dial_kind = DIAL_SCREEN; now = settings.brightness; least = 5; }   // at 0 the slider could not be seen
+    else if (!strcmp(job, "light")) { dial_kind = DIAL_RING; now = settings.ring; least = RING_LEAST; }
+    else return;
+    dial_card = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(dial_card);
+    lv_obj_set_scrollable(dial_card, false);
+    lv_obj_set_size(dial_card, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(dial_card, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(dial_card, LV_OPA_80, 0);
+    lv_obj_set_clickable(dial_card, true);
+    lv_obj_add_event_cb(dial_card, on_dial_close, LV_EVENT_CLICKED, NULL);
+    dial_lbl = lv_label_create(dial_card);
+    lv_obj_set_style_text_font(dial_lbl, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(dial_lbl, C_TEXT, 0);
+    lv_label_set_text_fmt(dial_lbl, "%s  %d%%", DIAL_NAME[dial_kind], now);
+    lv_obj_align(dial_lbl, LV_ALIGN_CENTER, 0, -48);
+    lv_obj_t *slider = lv_slider_create(dial_card);
+    lv_obj_set_size(slider, BOARD_W - 96, 22);
+    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_set_ext_click_area(slider, 26);             // a finger, not a pen
+    lv_obj_set_style_bg_color(slider, lv_color_hex(0x3a4048), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, C_BTN_ON, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(slider, 8, LV_PART_KNOB);
+    lv_slider_set_range(slider, least, 100);
+    lv_slider_set_value(slider, now, LV_ANIM_OFF);
+    lv_obj_add_event_cb(slider, on_dial, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_t *hint = lv_label_create(dial_card);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, C_DIM, 0);
+    lv_label_set_text(hint, "tap outside to close");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
 static void on_middle(lv_event_t *e)
 {
     if (tap_taken()) return;
-    if (server_speaking()) { server_stop_speech(); ESP_LOGI(TAG, "tap: stop"); }
+    if (server_talking() || light_turn_on()) { server_stop_by_hand(); ESP_LOGI(TAG, "tap: stop"); }   // while her turn goes on a tap only ever stops her
     else { wake_trigger(); ESP_LOGI(TAG, "tap: listen"); }
 }
 
@@ -145,9 +218,10 @@ static void draw_zones(void)
     static const struct { const char *job, *icon; } SIGNS[] = {
         {"light", LV_SYMBOL_TINT}, {"screen", LV_SYMBOL_POWER}, {"wake", LV_SYMBOL_BELL},
         {"mute", LV_SYMBOL_VOLUME_MAX}, {"listen", LV_SYMBOL_AUDIO}, {"tell", LV_SYMBOL_ENVELOPE},
+        {"louder", LV_SYMBOL_PLUS}, {"quieter", LV_SYMBOL_MINUS}, {"stop", LV_SYMBOL_STOP}, {"backup", LV_SYMBOL_SD_CARD},
     };
     static int was[4] = {-1, -1, -1, -1};
-    bool on[] = {!light_is_dark(), screen_on, wake_enabled(), !audio_muted(), true, true};
+    bool on[] = {!light_is_dark(), screen_on, wake_enabled(), !audio_muted(), true, true, true, true, true, true};
     for (int i = 0; i < 4; i++) {
         char job[BUTTON_JOB];
         int sign = -1;
@@ -242,10 +316,28 @@ static lv_obj_t *small_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t
 static void status_fill(void)
 {
     if (!status_card) return;
-    char text[480], up[24];
+    char text[640], up[24], card[96];
     uint32_t s = esp_timer_get_time() / 1000000;
     if (s >= 3600) snprintf(up, sizeof up, "%uh %um", (unsigned)(s / 3600), (unsigned)(s % 3600 / 60));
     else snprintf(up, sizeof up, "%um %us", (unsigned)(s / 60), (unsigned)(s % 60));
+    // the card: how many backups, when the newest was made (its name says: sapphire_2026-10-11_030012_daily...) and how they are
+    storage_state_t st;
+    storage_state(&st);
+    if (!st.mounted) strlcpy(card, "no card", sizeof card);
+    else if (st.writing) snprintf(card, sizeof card, "one arriving, %d%%", st.expect ? (int)(st.got * 100 / st.expect) : 0);
+    else if (!st.count) strlcpy(card, "none yet", sizeof card);
+    else {
+        char when[20] = "";
+        const char *n = st.newest;
+        if (!strncmp(n, "sapphire_", 9) && strlen(n) > 26 && n[13] == '-' && n[19] == '_')
+            snprintf(when, sizeof when, ", %.5s %.2s:%.2s", n + 14, n + 20, n + 22);
+        char how[40];
+        if (st.failed) strlcpy(how, "the last one FAILED", sizeof how);
+        else if (st.damaged) snprintf(how, sizeof how, "%d DAMAGED", st.damaged);
+        else if (st.checking) snprintf(how, sizeof how, "checking %d of %d", st.checked, st.to_check);
+        else strlcpy(how, st.unchecked ? "ok" : "all checked", sizeof how);
+        snprintf(card, sizeof card, "%d%s, %s", st.count, when, how);
+    }
     cJSON *words = lastwords_json(false);
     const cJSON *why = words ? cJSON_GetObjectItem(words, "reason") : NULL;
     snprintf(text, sizeof text,
@@ -256,13 +348,14 @@ static void status_fill(void)
              "Sapphire  %s\n"
              "program  %s   up %s\n"
              "RAM  %u KB free (low %u), %u MB spare\n"
+             "backups  %s\n"
              "started by  %s\n"
              "%s%s",
              settings.name, chat_name[0] ? chat_name : "-", brain_name[0] ? brain_name : "-", net_ip()[0] ? net_ip() : "no WiFi", net_rssi(),
              link_connected() ? "linked" : "NOT linked", PROJECT_VER, up,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024,
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024,
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / (1024 * 1024)),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / (1024 * 1024)), card,
              lastwords_reset(), cJSON_IsString(why) ? "last down  " : "", cJSON_IsString(why) ? why->valuestring : "");
     cJSON_Delete(words);
     lv_label_set_text(status_text_lbl, text);
@@ -270,6 +363,7 @@ static void status_fill(void)
 
 static void on_status_close(lv_event_t *e)
 {
+    if (tap_taken()) return;
     lv_obj_delete(status_card);
     status_card = NULL;
 }
@@ -286,11 +380,11 @@ static void on_about(lv_event_t *e)
     status_text_lbl = small_label(status_card, &lv_font_montserrat_14, C_TEXT);
     lv_obj_set_width(status_text_lbl, BOARD_W - 24);
     lv_label_set_long_mode(status_text_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_line_space(status_text_lbl, 5, 0);
-    lv_obj_align(status_text_lbl, LV_ALIGN_TOP_LEFT, 12, 10);
+    lv_obj_set_style_text_line_space(status_text_lbl, 4, 0);       // ten lines and the hint on 240
+    lv_obj_align(status_text_lbl, LV_ALIGN_TOP_LEFT, 12, 6);
     lv_obj_t *hint = small_label(status_card, &lv_font_montserrat_12, C_DIM);
-    lv_label_set_text(hint, "tap to close");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_label_set_text(hint, "tap to close.  Hold a corner: its slider");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -4);
     status_fill();
 }
 
@@ -374,7 +468,8 @@ static void build(void)
         lv_obj_set_size(zone[i], ZONE, ZONE);
         lv_obj_align(zone[i], where[i], 0, 0);
         lv_obj_set_clickable(zone[i], true);
-        lv_obj_add_event_cb(zone[i], on_zone, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(zone[i], on_zone, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);   // not the release of a hold
+        lv_obj_add_event_cb(zone[i], on_zone_held, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
         zone_btn[i] = plain(zone[i]);                   // a round button: sapphire when on, dark when off
         lv_obj_set_size(zone_btn[i], BUTTON, BUTTON);
         lv_obj_align(zone_btn[i], where[i], (i % 2) ? -6 : 6, (i < 2) ? 6 : -6);
@@ -538,7 +633,10 @@ uint8_t *ui_image_begin(int kind, int w, int h)
     if (!ok || kind < 0 || kind > 1 || w < 1 || h < 1 || w > BOARD_W || h > BOARD_H || !take()) return NULL;
     image_t *im = &images[kind];
     uint8_t *px = NULL;
-    if (!im->filling) {
+    // One task fills an image at a time (the glass task's queue), so one still
+    // "filling" here was left behind: its show or its drop missed the glass's
+    // door, and every image after it was refused until a restart.
+    {
         uint8_t *fresh = heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
         if (fresh) {
             if (kind == UI_PICTURE && picture_timer) { lv_timer_delete(picture_timer); picture_timer = NULL; }
@@ -556,6 +654,7 @@ bool ui_image_show(int kind, int w, int h, int seconds, const char *name)
 {
     if (!ok || kind < 0 || kind > 1 || !take()) return false;
     image_t *im = &images[kind];
+    bool shown = false;                                  // nothing to show is not "shown"
     if (im->px && im->filling && im->w == w && im->h == h) {
         uint16_t *p = (uint16_t *)im->px;                // the wire is big-endian, LVGL's RGB565 is little
         for (size_t i = 0, n = (size_t)w * h; i < n; i++) p[i] = (uint16_t)(p[i] << 8 | p[i] >> 8);
@@ -569,19 +668,27 @@ bool ui_image_show(int kind, int w, int h, int seconds, const char *name)
             lv_timer_set_repeat_count(picture_timer, 1);
             if (screen_on) wake_screen();
         }
+        shown = true;
     }
     lvgl_port_unlock();
-    return true;
+    return shown;
 }
 
-bool ui_image_drop(int kind)
+// `mine`: the caller is the one filling it (its upload broke off). Anyone else
+// asking for a clear while one is arriving is answered and nothing is freed:
+// the bytes still landing would be written into memory given back.
+static bool image_drop(int kind, bool mine)
 {
     if (!ok || kind < 0 || kind > 1 || !take()) return false;
+    if (images[kind].filling && !mine) { lvgl_port_unlock(); return true; }
     if (kind == UI_PICTURE) picture_end();
     else { image_free(UI_SCENE); scene_name[0] = 0; }
     lvgl_port_unlock();
     return true;
 }
+
+bool ui_image_drop(int kind) { return image_drop(kind, false); }
+bool ui_image_abort(int kind) { return image_drop(kind, true); }
 
 const char *ui_scene_name(void) { return scene_name; }
 bool ui_picture_on(void) { return images[UI_PICTURE].px && !images[UI_PICTURE].filling; }

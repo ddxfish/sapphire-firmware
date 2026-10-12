@@ -17,6 +17,7 @@
 #define STORAGE_NAME_MAX 96
 
 bool storage_start(void);                     // mount, sweep .partial files
+bool storage_alive(void);                     // as storage_ok, after asking the card: one that was pulled and put back is mounted again
 bool storage_ok(void);                        // a card is mounted
 bool storage_room(uint64_t *free_bytes, uint64_t *total_bytes);
 const char *storage_dir(void);                // the folder on the card

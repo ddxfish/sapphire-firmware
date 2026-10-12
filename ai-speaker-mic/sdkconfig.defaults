@@ -111,3 +111,8 @@ CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
 CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
 CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+
+# 0.7.3: the web server's 5 + 3 sockets must leave room for the board's own calls to Sapphire
+CONFIG_LWIP_MAX_SOCKETS=16
+# nothing this board is sent nests deeper than 4; at 1000 a broken body could run a 6 KB stack out
+CONFIG_CJSON_NESTING_LIMIT=16

@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -55,7 +56,7 @@ void ota_start(void)
     esp_ota_img_states_t st;
     if (run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGW(TAG, "a new program on trial in slot %s: kept once WiFi joins or %d s pass", run->label, FINE_AFTER_S);
-        xTaskCreate(fine_later, "ota-fine", 2048, NULL, 2, NULL);
+        xTaskCreate(fine_later, "ota-fine", 4096, NULL, 2, NULL);   // it writes flash and logs: on 2 KB a fall here would roll a good program back
     } else {
         said_fine = true;
     }
@@ -106,7 +107,13 @@ void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
         if (yield) yield();
         int n = httpd_req_recv(req, (char *)buf, left < OTA_CHUNK ? left : OTA_CHUNK);
         if (n <= 0) { problem = 400; break; }
-        if (first) { first = false; if (buf[0] != 0xE9) { problem = 422; break; } }     // an ESP image starts so
+        if (first) {
+            first = false;
+            if (buf[0] != 0xE9) { problem = 422; break; }       // an ESP image starts so
+            // ... and says whose program it is, 80 bytes in (esp_app_desc_t.project_name). Another
+            // board's program for the same chip passed every check, ran, and was kept.
+            if (n >= 112 && strncmp((char *)buf + 80, esp_app_get_description()->project_name, 32)) { problem = 409; break; }
+        }
         if (esp_ota_write(ota, buf, n) != ESP_OK) { problem = 507; break; }
         mbedtls_sha256_update(&sha, buf, n);
         left -= n;
@@ -118,7 +125,8 @@ void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
     mbedtls_sha256_free(&sha);
     if (problem) {
         esp_ota_abort(ota);
-        refuse(req, problem, problem == 422 ? "not an ESP32 program" : problem == 507 ? "the slot could not be written"
+        refuse(req, problem == 409 ? 422 : problem, problem == 422 ? "not an ESP32 program" : problem == 409 ? "a program for another kind of board"
+               : problem == 507 ? "the slot could not be written"
                : "the program did not arrive whole");
         goto done;
     }
@@ -138,7 +146,7 @@ void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
     cJSON_AddStringToObject(j, "sha256", hex);
     answer(req, 200, j);
     ESP_LOGI(TAG, "new program in slot %s (%u bytes): restarting onto it", next->label, (unsigned)req->content_len);
-    xTaskCreate(restart_soon, "ota-restart", 2048, NULL, 5, NULL);
+    xTaskCreate(restart_soon, "ota-restart", 3072, NULL, 5, NULL);
 done:
     httpd_req_async_handler_complete(req);
 }

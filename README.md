@@ -15,7 +15,7 @@ so Sapphire shows only what a board says it has.
 ## Put it on a board
 
 You do not need this repository for that. In Sapphire: Settings > Devices >
-**+ Add Board**. She downloads the board's files from
+**+ Add Satellite**, then **Dev board**. She downloads the board's files from
 this repository's release and writes them, from Chrome or Edge or from the
 computer she runs on.
 
@@ -59,7 +59,7 @@ esptool.py write_flash 0x0 cyd35-0.3.0.bin
 ```
 
 This also clears the board's saved name and WiFi, so it starts as a new
-board. Set it up in Sapphire afterwards (**+ Add Board**).
+board. Set it up in Sapphire afterwards (**+ Add Satellite**).
 
 ## A new board
 

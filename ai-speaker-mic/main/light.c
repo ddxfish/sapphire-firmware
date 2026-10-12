@@ -15,6 +15,8 @@
 #include "nvs.h"
 
 #include "board.h"
+#include "settings.h"
+#include "wake.h"
 
 static const char *TAG = "light";
 #define FPS 25
@@ -38,7 +40,8 @@ static look_t looks[LOOK_COUNT];
 static int hours_from = 8 * 60, hours_until = 0;   // minutes of the day; equal = always on. Built in: dark 00:00-08:00
 static look_t held;                                // what she set
 static int64_t held_until_us;                      // 0 = not held; -1 = until cleared
-static bool dark;                                  // off: dark until cleared
+static bool dark;                                  // off: dark until cleared, through every state and every restart (settings.ring_off)
+static bool backing;                               // a backup is landing on the card
 static char cue[16] = "starting";
 static int error_left;
 static int frame;
@@ -85,10 +88,13 @@ static const char *color_name(const look_t *l)
 
 // --- drawing -----------------------------------------------------------------------
 
-static float wave(float t, int bpm, pattern_t p)
+// Time is a double all the way to the beat's own fraction: as a float counted
+// from boot it lost its small steps with the weeks, and by the third month the
+// spinner stood still and a blink could come out solid (scout, 2026-10-11).
+static float wave(double t, int bpm, pattern_t p)
 {
-    float beat = t * bpm / 60.0f;              // beats since start
-    float ph = beat - floorf(beat);
+    double beats = t * bpm / 60.0;             // beats since start
+    float ph = (float)(beats - floor(beats)), beat = ph;   // sin is the same one beat on
     switch (p) {
     case PAT_PULSE: return 0.5f + 0.5f * sinf(2 * M_PI * beat);
     case PAT_BLINK: return ph < 0.5f ? 1 : 0;
@@ -99,29 +105,32 @@ static float wave(float t, int bpm, pattern_t p)
 
 static uint8_t shown[3];               // the frame's average color: the glass mirrors the ring
 
-static void draw_look(const look_t *l, float t)
+static float part(double x) { return (float)(x - floor(x)); }
+
+static void draw_look(const look_t *l, double t)
 {
     unsigned sum_r = 0, sum_g = 0, sum_b = 0;
     for (int i = 0; i < BOARD_LEDS; i++) {
         float level, hue = 0;
         if (l->pattern == PAT_SPIN) {
-            float turn = t * l->bpm / 60.0f;
-            float pos = (turn - floorf(turn)) * BOARD_LEDS;
+            double turn = t * l->bpm / 60.0;
+            float pos = part(turn) * BOARD_LEDS;
             float d = fmodf(i - pos + BOARD_LEDS, BOARD_LEDS);   // distance behind the lead
             level = d < 1 ? 1 : d < 2 ? 0.35f : d < 3 ? 0.12f : 0;
-            hue = (float)i / BOARD_LEDS + turn * 0.1f;
+            hue = (float)i / BOARD_LEDS + part(turn * 0.1);
         } else if (l->pattern == PAT_RAINBOW) {
             level = 1;
-            hue = (float)i / BOARD_LEDS + t * l->bpm / 60.0f / 4;
+            hue = (float)i / BOARD_LEDS + part(t * l->bpm / 60.0 / 4);
         } else {
             level = wave(t, l->bpm, l->pattern);
-            hue = t * l->bpm / 60.0f / 8 + (float)i / BOARD_LEDS;
+            hue = part(t * l->bpm / 60.0 / 8) + (float)i / BOARD_LEDS;
         }
         level = l->floor + (l->ceiling - l->floor) * level;
         uint8_t r, g, b;
         if (l->rainbow || l->pattern == PAT_RAINBOW) hsv(hue, level, &r, &g, &b);
         else { r = l->r * level; g = l->g * level; b = l->b * level; }
-        led_strip_set_pixel(strip, i, r, g, b);
+        int ring = settings.ring;                  // the ring's own brightness; the glass mirrors the look, not this
+        led_strip_set_pixel(strip, i, r * ring / 100, g * ring / 100, b * ring / 100);
         sum_r += r; sum_g += g; sum_b += b;
     }
     shown[0] = sum_r / BOARD_LEDS; shown[1] = sum_g / BOARD_LEDS; shown[2] = sum_b / BOARD_LEDS;
@@ -138,6 +147,7 @@ static const look_t *showing(void)
     if (!strcmp(cue, "error")) { plain = (look_t){255, 0, 0, false, PAT_BLINK, 150, 0, 0.4f, true}; return &plain; }
     if (!strcmp(cue, "camera")) { plain = (look_t){255, 255, 255, false, PAT_BLINK, 150, 0, 0.5f, true}; return &plain; }   // a picture is about to be taken
     if (!strcmp(cue, "nolink") && light_in_hours()) return &looks[LOOK_NOLINK];
+    if (backing) { plain = (look_t){255, 100, 0, false, PAT_PULSE, 30, 0.0f, 0.15f, true}; return &plain; }   // orange, soft: it lands at night
     if (held_until_us) {
         if (held_until_us > 0 && esp_timer_get_time() > held_until_us) held_until_us = 0;
         else return &held;
@@ -146,6 +156,11 @@ static const look_t *showing(void)
     return &looks[light_in_hours() ? LOOK_RESTING : LOOK_NIGHT];
 }
 
+// Turned off, the ring is dark through every state: only the camera's warning
+// shows, because the room is owed it. The look is still worked out, so the
+// glass's middle goes on saying when she listens.
+static bool hidden(void) { return dark && strcmp(cue, "camera"); }
+
 static void light_task(void *arg)
 {
     for (;;) {
@@ -153,7 +168,11 @@ static void light_task(void *arg)
         const look_t *l = strcmp(cue, "shown") ? showing() : NULL;
         if (!strcmp(cue, "shown")) { /* light_show painted it */ }
         else if (black(l)) { led_strip_clear(strip); shown[0] = shown[1] = shown[2] = 0; }
-        else { draw_look(l, frame / (float)FPS); led_strip_refresh(strip); }
+        else {
+            draw_look(l, esp_timer_get_time() / 1e6);
+            if (hidden()) led_strip_clear(strip);
+            else led_strip_refresh(strip);
+        }
         if (error_left && --error_left == 0) strcpy(cue, "idle");
         xSemaphoreGive(lock);
         frame++;
@@ -184,7 +203,10 @@ void light_cue_from_brain(const char *state)
         strlcpy(brain, state, sizeof brain);
     bool speaking = !strcmp(cue, "speaking");
     xSemaphoreGive(lock);
-    if (!speaking) light_cue(state);           // sound playing is the board's own truth
+    // Sound playing is the board's own truth, and so is a question being heard
+    // or sent: the turn she was cut off in still sends its tool, thinking and
+    // idle, and they painted over the yellow of the new question (2026-10-11).
+    if (!speaking && !wake_busy() && strcmp(light_cue_now(), "camera")) light_cue(state);   // nor over the camera's warning: the room is owed it
 }
 
 void light_speech_done(void)
@@ -192,11 +214,30 @@ void light_speech_done(void)
     if (!strip) return;
     xSemaphoreTake(lock, portMAX_DELAY);
     bool turn_goes_on = !strcmp(brain, "thinking") || !strcmp(brain, "tool");
+    bool mine = !strcmp(cue, "speaking");          // else the ring is someone else's by now: the wake word was said over her, or the camera warns
     char next[16];
     strlcpy(next, turn_goes_on ? brain : "idle", sizeof next);
     xSemaphoreGive(lock);
-    light_cue(next);
+    if (mine) light_cue(next);
 }
+
+// After the camera's shot: back to the brain's cue, or idle.
+void light_camera_done(void)
+{
+    if (!strip) return;
+    light_cue(light_turn_on() ? brain : "idle");
+}
+
+// A question has just been sent and the ring still says thinking by the
+// board's own hand: if her cues passed meanwhile (not painted while it was
+// sending), show where she is now.
+void light_settle(void)
+{
+    if (!strip || strcmp(cue, "thinking")) return;
+    if (!strcmp(brain, "idle") || !strcmp(brain, "error") || !strcmp(brain, "tool")) light_cue(brain);
+}
+
+bool light_turn_on(void) { return !strcmp(brain, "thinking") || !strcmp(brain, "tool"); }
 
 void light_show(int r, int g, int b, int seconds)
 {
@@ -256,11 +297,19 @@ bool light_parse(const cJSON *json, look_t *out, const look_t *base)
     return true;
 }
 
+// Kept across a restart: a ring someone turned off stays off. Saved by
+// settings_save_soon, since the glass's corner and the keys call from PSRAM stacks.
+static void set_dark(bool on)
+{
+    dark = on;
+    if (settings.ring_off != on) { settings.ring_off = on; settings_save_soon(); }
+}
+
 void light_hold(const look_t *look, float seconds)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
     held = *look;
-    dark = false;
+    set_dark(false);
     held_until_us = seconds > 0 ? esp_timer_get_time() + (int64_t)(seconds * 1000000) : -1;
     xSemaphoreGive(lock);
 }
@@ -268,7 +317,7 @@ void light_hold(const look_t *look, float seconds)
 void light_dark(void)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
-    dark = true;
+    set_dark(true);
     held_until_us = 0;
     xSemaphoreGive(lock);
 }
@@ -276,7 +325,7 @@ void light_dark(void)
 void light_release(void)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
-    dark = false;
+    set_dark(false);
     held_until_us = 0;
     xSemaphoreGive(lock);
 }
@@ -292,6 +341,7 @@ const look_t *light_look(look_slot_t slot) { return &looks[slot]; }
 
 void light_set_hours(int from_min, int until_min)
 {
+    if (from_min < 0 || from_min >= 1440 || until_min < 0 || until_min >= 1440) return;   // not a time of day: the hours stay as they were
     hours_from = from_min;
     hours_until = until_min;
 }
@@ -330,6 +380,7 @@ const char *light_cue_now(void) { return cue; }
 void light_current(uint8_t *r, uint8_t *g, uint8_t *b) { *r = shown[0]; *g = shown[1]; *b = shown[2]; }
 bool light_is_dark(void) { return dark; }
 void light_toggle_dark(void) { if (dark) light_release(); else light_dark(); }
+void light_backup(bool on) { backing = on; }
 
 cJSON *light_status(void)
 {
@@ -337,7 +388,9 @@ cJSON *light_status(void)
     const look_t *l = showing();
     cJSON_AddStringToObject(j, "state", held_until_us ? "custom" : !strcmp(cue, "idle") ? "idle" : cue);
     cJSON_AddStringToObject(j, "animation", l && l->set ? PATTERNS[l->pattern] : "off");
-    cJSON_AddBoolToObject(j, "blackout", black(l));
+    cJSON_AddBoolToObject(j, "blackout", black(l) || hidden());
+    cJSON_AddBoolToObject(j, "off", dark);                 // turned off: no state shows either, until it is turned on
+    cJSON_AddNumberToObject(j, "level", settings.ring);
     cJSON_AddBoolToObject(j, "in_hours", light_in_hours());
     return j;
 }
@@ -395,7 +448,7 @@ void light_load(void)
                     if (one && light_parse(one, &l, &DEFAULTS[i])) looks[i] = l;
                 }
                 float f, u;
-                if (number(j, "from", &f) && number(j, "until", &u)) { hours_from = (int)f; hours_until = (int)u; }
+                if (number(j, "from", &f) && number(j, "until", &u) && f >= 0 && f < 1440 && u >= 0 && u < 1440) { hours_from = (int)f; hours_until = (int)u; }
                 cJSON_Delete(j);
             }
         }
@@ -408,6 +461,7 @@ void light_start(void)
 {
     lock = xSemaphoreCreateMutex();
     light_load();
+    dark = settings.ring_off;
     led_strip_config_t cfg = {
         .strip_gpio_num = BOARD_LED_GPIO,
         .max_leds = BOARD_LEDS,

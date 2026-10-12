@@ -43,7 +43,8 @@ static httpd_handle_t server;
 
 #define BOARD "waveshare-s3-audio"
 #define SPEAK_CHUNK 4096
-#define HALT_MS 3000                   // after a stop, the rest of that reply is refused this long
+#define HALT_MS 3000                   // after her own stop (/audio/stop), the rest of that reply is refused this long: she has stopped sending too
+#define HALT_HERE_MS 60000             // after a stop made on the board while her turn goes on: until it ends or a question is sent (server_reply_over), this at most
 static volatile bool cut;              // /audio/stop while a sentence plays
 static volatile bool speaking;
 static int64_t halted_until_ms;
@@ -173,17 +174,33 @@ static esp_err_t on_health(httpd_req_t *req)
         }
         cJSON *can = cJSON_AddArrayToObject(st, "can");
         cJSON_AddItemToArray(can, cJSON_CreateString("format"));
+        storage_state_t card;
+        storage_state(&card);
+#ifdef BOARD_STORAGE_CHECKS
+        cJSON_AddItemToArray(can, cJSON_CreateString("check"));
+        cJSON *ch = cJSON_AddObjectToObject(st, "checks");
+        cJSON_AddBoolToObject(ch, "running", card.checking);
+        cJSON_AddNumberToObject(ch, "done", card.checked);
+        cJSON_AddNumberToObject(ch, "of", card.to_check);
+        cJSON_AddNumberToObject(ch, "damaged", card.damaged);
+        cJSON_AddNumberToObject(ch, "unchecked", card.unchecked);
+#endif
+        cJSON_AddNumberToObject(st, "count", card.count);
+        cJSON_AddBoolToObject(st, "writing", card.writing);
+        cJSON_AddBoolToObject(st, "failed", card.failed);
     }
     cJSON *plays = cJSON_AddObjectToObject(j, "plays");
     cJSON_AddStringToObject(plays, "type", "audio/wav");
     cJSON_AddNumberToObject(plays, "rate", AUDIO_RATE);
     cJSON_AddNumberToObject(plays, "channels", 1);
     cJSON_AddNumberToObject(j, "volume", audio_volume());
+    cJSON_AddNumberToObject(j, "volume_step", settings.vol_step);   // what a volume button adds or takes: POST /volume?step=
     cJSON_AddItemToObject(j, "led", light_status());
     cJSON_AddNumberToObject(j, "uptime_s", esp_timer_get_time() / 1000000);
     cJSON *ww = cJSON_AddObjectToObject(j, "wakeword");
     cJSON_AddBoolToObject(ww, "enabled", wake_enabled());
     cJSON_AddBoolToObject(ww, "running", wake_running());
+    cJSON_AddBoolToObject(ww, "paused", wake_paused());         // a backup is landing: it hears nothing until that ends
     cJSON_AddStringToObject(ww, "model", wake_model_name());
     cJSON_AddStringToObject(ww, "format", "tflite");            // microWakeWord: the Wakeword Maker sends this family
     cJSON *link = cJSON_AddObjectToObject(j, "link");
@@ -237,8 +254,8 @@ static void speak_work(httpd_req_t *req)
     wav_info_t info = {0};
     bool headed = false, stopped = false;
     int problem = 0;
-    if (esp_timer_get_time() / 1000 < halted_until_ms) {
-        stopped = true;                                  // the rest of a stopped reply: taken, not played
+    if (esp_timer_get_time() / 1000 < halted_until_ms || wake_busy()) {
+        stopped = true;                                  // the rest of a stopped reply, or a sentence while the board is hearing a question: taken, not played
     } else {
         cut = false;
         speaking = true;
@@ -309,18 +326,44 @@ static esp_err_t on_speak(httpd_req_t *req)
 
 bool server_speaking(void) { return speaking; }
 
-bool server_stop_speech(void)
+// Sound is playing or waiting to. Between two sentences of a reply it is
+// light_turn_on() that says she is still at it; a timed tail here swallowed
+// the tap that answers her and refused a minute of speech (scout, 2026-10-11).
+bool server_talking(void) { return speaking || (speak_queue && uxQueueMessagesWaiting(speak_queue)); }
+
+static bool stop_for(int ms)
 {
     bool was = speaking;
     cut = true;
-    halted_until_ms = esp_timer_get_time() / 1000 + HALT_MS;
+    halted_until_ms = esp_timer_get_time() / 1000 + ms;
     return was;
 }
+
+// A stop made on the board (the middle of the glass, a button, the wake word
+// said over her): the sentence is cut and every one after it is answered
+// "stopped", which is how Sapphire learns to drop the rest of the reply.
+// The long hold only while her turn goes on: its end clears it. A plain
+// announcement has no turn to end it, so it gets the short one.
+bool server_stop_speech(void) { return stop_for(light_turn_on() ? HALT_HERE_MS : HALT_MS); }
+
+// The same by a hand (the middle of the glass, a button): Sapphire is told too,
+// so a turn that is still thinking ends now and not at its next sentence. Not
+// for the wake word said over her: claiming the wake tells her already, and a
+// second word could land on the new question's turn.
+bool server_stop_by_hand(void)
+{
+    bool turn = light_turn_on(), was = server_stop_speech();
+    if (turn) link_ask("stop");
+    return was;
+}
+
+// The stopped reply is over: her turn ended, or a new question went to her.
+void server_reply_over(void) { halted_until_ms = 0; }
 
 static esp_err_t on_stop(httpd_req_t *req)
 {
     if (!let_in(req)) return ESP_OK;
-    bool was = server_stop_speech();
+    bool was = stop_for(HALT_MS);
     ESP_LOGI(TAG, "audio/stop: %s", was ? "cut the playback" : "nothing was playing");
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
@@ -345,7 +388,7 @@ static esp_err_t on_listen(httpd_req_t *req)
     }
     recording_t rec;
     if (!wake_record_now(max_s, use_vad, &rec))
-        return refuse(req, 409, "already listening for a question");
+        return refuse(req, 409, "already listening for a question, or no sound is coming in from the microphones");
     uint8_t head[WAV_HEADER];
     wav_header(head, AUDIO_RATE, 1, rec.samples * 2);
     httpd_resp_set_type(req, "audio/wav");
@@ -441,7 +484,7 @@ static int minutes(const cJSON *j, const char *name, int fallback)
 {
     const cJSON *v = cJSON_GetObjectItem(j, name);
     int h, m;
-    if (!cJSON_IsString(v) || sscanf(v->valuestring, "%d:%d", &h, &m) != 2) return fallback;
+    if (!cJSON_IsString(v) || sscanf(v->valuestring, "%d:%d", &h, &m) != 2 || h < 0 || h > 23 || m < 0 || m > 59) return fallback;
     return (h * 60 + m) % (24 * 60);
 }
 
@@ -508,6 +551,8 @@ static void unescape(char *s)
 static esp_err_t on_wakeword_model(httpd_req_t *req)
 {
     if (!let_in(req)) return ESP_OK;
+    if (ota_running || storage_busy()) return refuse(req, 409, "busy: a program or a backup is arriving, and this restarts the board");
+    settings_flush();
     if (req->method == HTTP_DELETE) {
         wake_model_forget();
         cJSON *j = cJSON_CreateObject();
@@ -532,6 +577,8 @@ static esp_err_t on_wakeword_model(httpd_req_t *req)
     int window = 5, step = 10;
     if (httpd_query_key_value(query, "sliding_window", text, sizeof text) == ESP_OK) window = atoi(text);
     if (httpd_query_key_value(query, "step_ms", text, sizeof text) == ESP_OK) step = atoi(text);
+    if (window < 1 || window > 50) return refuse(req, 400, "sliding_window is 1 to 50");
+    if (step < 5 || step > 30) return refuse(req, 400, "step_ms is 5 to 30: the model's window is 30 ms");
     size_t size = req->content_len;
     if (size < 4096 || size > 1536 * 1024) return refuse(req, 413, "a model is 4 KB to 1.5 MB");
     uint8_t *data = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
@@ -577,6 +624,7 @@ static esp_err_t on_power(httpd_req_t *req)
     if (!query_value(req, "action", text, sizeof text)) return refuse(req, 400, "action=restart or shutdown");
     bool off = !strcmp(text, "shutdown");
     if (!off && strcmp(text, "restart")) return refuse(req, 400, "action=restart or shutdown");
+    settings_flush();                                   // what a slider or a key changed a moment ago
     xTaskCreate(power_task, "power", 3072, off ? (void *)1 : NULL, 5, NULL);
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
@@ -585,16 +633,41 @@ static esp_err_t on_power(httpd_req_t *req)
     return say_json(req, 200, j);
 }
 
+// A number and nothing else. "abc" was taken for 0: a mic at 0 dB hears no
+// wake word, and it was saved (scout, 2026-10-11).
+static bool number_of(const char *text, double *out)
+{
+    char *end;
+    double v = strtod(text, &end);
+    if (end == text || *end || v != v) return false;
+    *out = v;
+    return true;
+}
+
 static esp_err_t on_volume(httpd_req_t *req)
 {
     if (!let_in(req)) return ESP_OK;
     if (req->method == HTTP_POST) {
         char text[8];
-        if (!query_value(req, "level", text, sizeof text)) return refuse(req, 400, "level=0 to 100");
-        audio_set_volume(atoi(text));
+        bool any = false;
+        double v;
+        if (query_value(req, "step", text, sizeof text)) {       // what one press of a volume button adds or takes
+            if (!number_of(text, &v)) return refuse(req, 400, "step is a number, 1 to 50");
+            int n = (int)v;
+            n = n < 1 ? 1 : n > 50 ? 50 : n;
+            if (n != settings.vol_step) { settings.vol_step = n; settings_save(); }
+            any = true;
+        }
+        if (query_value(req, "level", text, sizeof text)) {
+            if (!number_of(text, &v)) return refuse(req, 400, "level is a number, 0 to 100");
+            audio_set_volume((int)v);
+            any = true;
+        }
+        if (!any) return refuse(req, 400, "level=0 to 100, and/or step=1 to 50");
     }
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "volume", audio_volume());
+    cJSON_AddNumberToObject(j, "step", settings.vol_step);
     return say_json(req, 200, j);
 }
 
@@ -611,14 +684,23 @@ static esp_err_t on_mic(httpd_req_t *req)
     if (req->method == HTTP_POST) {
         char text[8];
         bool any = false;
-        if (query_value(req, "gain", text, sizeof text)) { audio_set_mic_gain(atof(text)); any = true; }
+        double v;
+        if (query_value(req, "gain", text, sizeof text)) {
+            if (!number_of(text, &v)) return refuse(req, 400, "gain is a number of dB, 0 to 37.5");
+            audio_set_mic_gain((float)v);
+            any = true;
+        }
         if (query_value(req, "agc", text, sizeof text)) {
             bool want = text[0] == 'o' ? text[1] == 'n' : (text[0] == '1' || text[0] == 't');
-            if (want != settings.agc) { settings.agc = want; settings_save(); restart = true; }
+            if (want != settings.agc) {
+                if (ota_running || storage_busy()) return refuse(req, 409, "busy: a program or a backup is arriving, and this restarts the board");
+                settings.agc = want; settings_save(); restart = true;
+            }
             any = true;
         }
         if (query_value(req, "max_s", text, sizeof text)) {
-            int n = atoi(text);
+            if (!number_of(text, &v)) return refuse(req, 400, "max_s is a number of seconds, 5 to 60");
+            int n = (int)v;
             n = n < QUESTION_MAX_S_LEAST ? QUESTION_MAX_S_LEAST : n > QUESTION_MAX_S_MOST ? QUESTION_MAX_S_MOST : n;
             if (n != settings.question_max_s) { settings.question_max_s = n; settings_save(); }
             any = true;
@@ -644,6 +726,21 @@ static esp_err_t on_sounds(httpd_req_t *req)
     return say_json(req, 200, j);
 }
 
+// POST /storage/check: every backup read back against the hash kept when it was written, now.
+// It runs by itself; /health `storage.checks` says how far it is and what it found.
+static esp_err_t on_storage_check(httpd_req_t *req)
+{
+    if (!let_in(req)) return ESP_OK;
+    if (!storage_ok()) return refuse(req, 503, "no card");
+#ifdef BOARD_STORAGE_CHECKS
+    if (!storage_check_now()) return refuse(req, 409, "a check is running already");
+#endif
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddBoolToObject(j, "checking", true);
+    return say_json(req, 200, j);
+}
+
 static esp_err_t on_missing(httpd_req_t *req, httpd_err_code_t err)
 {
     return refuse(req, 404, "this board has no such address");
@@ -664,7 +761,7 @@ static const char *file_name(httpd_req_t *req)
 static esp_err_t on_storage(httpd_req_t *req)
 {
     if (!let_in(req)) return ESP_OK;
-    if (!storage_ok()) return refuse(req, 503, "no card");
+    if (!storage_alive()) return refuse(req, 503, "no card");
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
     cJSON_AddStringToObject(j, "path", storage_dir());
@@ -684,11 +781,16 @@ static esp_err_t on_storage(httpd_req_t *req)
         while ((e = readdir(d))) {
             size_t n = strlen(e->d_name);
             if (n > 8 && !strcmp(e->d_name + n - 8, ".partial")) continue;
+            if (n > 7 && !strcmp(e->d_name + n - 7, ".sha256")) continue;      // the board's own, beside each backup
             if (!storage_path(e->d_name, path, sizeof path) || stat(path, &st) || !S_ISREG(st.st_mode)) continue;
             cJSON *f = cJSON_CreateObject();
             cJSON_AddStringToObject(f, "name", e->d_name);
             cJSON_AddNumberToObject(f, "size", (double)st.st_size);
             cJSON_AddNumberToObject(f, "mtime", (double)st.st_mtime);
+#ifdef BOARD_STORAGE_CHECKS
+            int checked = storage_checked(e->d_name);          // "ok": false = damaged; absent = no hash was kept
+            if (checked >= 0 && n > 12 && !strcmp(e->d_name + n - 12, ".sapphirebak")) cJSON_AddBoolToObject(f, "ok", checked == 1);
+#endif
             cJSON_AddItemToArray(files, f);
         }
         closedir(d);
@@ -702,6 +804,11 @@ static void store_put(httpd_req_t *req)
     bool plain_ok = storage_name_plain_ok(name);
     storage_write_t *w = storage_write_begin(name, req->content_len);
     if (!w) { refuse(req, 409, "another backup is arriving, or the card is gone"); goto done; }
+    // A backup is the board's whole job while it lands and is read back (0.7.0):
+    // no wake word, no question, the ring and the glass say so. Her question
+    // during one reached nobody (2026-10-10): the stream holds the WiFi buffers.
+    bool quiet = !plain_ok;
+    if (quiet) { wake_pause(true); light_backup(true); ui_status("backup"); }
     uint8_t *buf = heap_caps_malloc(STORE_CHUNK, MALLOC_CAP_SPIRAM);
     size_t left = req->content_len, seen = 0;
     uint8_t head[12];
@@ -731,17 +838,16 @@ static void store_put(httpd_req_t *req)
         if (problem == 422) refuse(req, 400, "not a sealed backup: plaintext never lands on this card");
         else if (problem == 507) refuse(req, 507, "the card is full or failed while writing");
         else refuse(req, 400, "the backup did not arrive whole");
-        goto done;
+        goto awake;
     }
     char sha[65];
     uint64_t size = 0;
-    if (!storage_write_finish(w, sha, &size)) { refuse(req, 507, "the card could not keep the backup"); goto done; }
+    if (!storage_write_finish(w, sha, &size)) { refuse(req, 507, "the card could not keep the backup"); goto awake; }
     char want[72] = {0};
     if (httpd_req_get_hdr_value_str(req, "X-Sha256", want, sizeof want) == ESP_OK && want[0] && strcasecmp(want, sha)) {
-        char path[200];
-        if (storage_path(name, path, sizeof path)) unlink(path);
+        storage_remove(name);                                  // and the hash beside it
         refuse(req, 422, "sha256 mismatch: dropped");
-        goto done;
+        goto awake;
     }
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
@@ -749,6 +855,8 @@ static void store_put(httpd_req_t *req)
     cJSON_AddNumberToObject(j, "size", (double)size);
     cJSON_AddStringToObject(j, "sha256", sha);
     say_json(req, 200, j);
+awake:
+    if (quiet) { wake_pause(false); light_backup(false); ui_status(""); }
 done:
     httpd_req_async_handler_complete(req);
 }
@@ -904,7 +1012,7 @@ static void image_work(httpd_req_t *req)
     int w = query_value(req, "w", text, sizeof text) ? atoi(text) : 0;
     int h = query_value(req, "h", text, sizeof text) ? atoi(text) : 0;
     int seconds = query_value(req, "seconds", text, sizeof text) ? atoi(text) : PICTURE_DEFAULT_S;
-    char name[48] = {0};
+    char name[64] = {0};
     if (query_value(req, "name", text, sizeof text)) { unescape(text); strlcpy(name, text, sizeof name); }
     if (w < 1 || h < 1 || w > BOARD_W || h > BOARD_H || req->content_len != (size_t)w * h * 2) {
         refuse(req, 400, "w and h up to the screen's, and exactly w*h*2 bytes of RGB565");
@@ -915,7 +1023,7 @@ static void image_work(httpd_req_t *req)
     size_t have = 0, want = (size_t)w * h * 2;
     while (have < want) {
         int n = httpd_req_recv(req, (char *)px + have, want - have > 8192 ? 8192 : want - have);
-        if (n <= 0) { ui_image_drop(kind); refuse(req, 400, "the image did not arrive whole"); goto done; }
+        if (n <= 0) { ui_image_abort(kind); refuse(req, 400, "the image did not arrive whole"); goto done; }
         have += n;
     }
     if (!ui_image_show(kind, w, h, seconds, name)) { refuse(req, 503, GLASS_STUCK); goto done; }
@@ -1005,6 +1113,7 @@ static esp_err_t on_screen_settings(httpd_req_t *req)
         if (!cJSON_IsNumber(v)) continue;
         int n = (int)v->valuedouble;
         n = n < 0 ? 0 : n > fields[i].max ? fields[i].max : n;
+        if (i == 0 && n < 5) n = 5;                             // a glass at 0 is black and its buttons still act: "off" is /screen/power
         if (n != *fields[i].at) { *fields[i].at = n; changed = true; }
     }
     const cJSON *flip = cJSON_GetObjectItem(in, "flip");       // 180 degrees, for a board mounted the other way up
@@ -1053,13 +1162,11 @@ static esp_err_t on_mute(httpd_req_t *req)
 static esp_err_t on_storage_file(httpd_req_t *req)
 {
     if (!let_in(req)) return ESP_OK;
-    if (!storage_ok()) return refuse(req, 503, "no card");
+    if (!storage_alive()) return refuse(req, 503, "no card");
     const char *name = file_name(req);
     if (!storage_name_ok(name)) return refuse(req, 400, "bad name");
     if (req->method == HTTP_DELETE) {
-        char path[200];
-        storage_path(name, path, sizeof path);
-        if (unlink(path)) return refuse(req, 404, "no such file");
+        if (!storage_remove(name)) return refuse(req, 404, "no such file, or the card is busy");
         cJSON *j = cJSON_CreateObject();
         cJSON_AddBoolToObject(j, "ok", true);
         return say_json(req, 200, j);
@@ -1074,6 +1181,7 @@ static esp_err_t on_storage_file(httpd_req_t *req)
     if (storage_room(&free_b, NULL) && (uint64_t)req->content_len + (16u << 20) > free_b)
         return refuse(req, 507, "not enough room on the card");
     if (storage_busy()) return refuse(req, 409, "another backup is arriving");
+    if (ota_running) return refuse(req, 409, "a program is arriving: the board restarts when it has");
     return hand_to_store(req, store_put);
 }
 
@@ -1094,6 +1202,10 @@ void server_start(void)
     cfg.server_port = 80;
     cfg.stack_size = 6144;                    // internal RAM (its handlers save settings to flash); 2.8 KB is the most it has used
     cfg.max_uri_handlers = 40;
+    // 5 and the server's own 3 of LWIP's 16: Sapphire keeps her connections open, and at the
+    // default 7 of 10 she could hold every socket the board has, with none left for its own
+    // question to her. Past 5 the least used idle one is closed (lru_purge_enable).
+    cfg.max_open_sockets = 5;
     cfg.core_id = 1;                                    // core 0 is WiFi + AFE: saturated while a backup lands (2026-10-06)
     cfg.uri_match_fn = httpd_uri_match_wildcard;        // /storage/* ; every other route is still exact
     cfg.recv_wait_timeout = 30;
@@ -1139,6 +1251,7 @@ void server_start(void)
         {"/storage", HTTP_GET, on_storage, NULL},
         {"/firmware", HTTP_PUT, on_firmware, NULL},
         {"/storage/format", HTTP_POST, on_storage_format, NULL},
+        {"/storage/check", HTTP_POST, on_storage_check, NULL},
         {"/storage/*", HTTP_PUT, on_storage_file, NULL},
         {"/storage/*", HTTP_GET, on_storage_file, NULL},
         {"/storage/*", HTTP_DELETE, on_storage_file, NULL},

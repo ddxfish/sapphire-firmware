@@ -59,7 +59,10 @@ static void capture(record_t *r)
         if (h == me) esp_backtrace_get_start(&f.pc, &f.sp, &f.next_pc);
         else {
             for (int k = 0; k < configNUMBER_OF_CORES; k++) if (xTaskGetCurrentTaskHandleForCore(k) == h) c->running = 1;
+            // a task running on the other core has moved on from the frame it was last switched out
+            // with, and a stack pointer that is not one faults in the walk: named, not walked
             XtExcFrame *x = (XtExcFrame *)snaps[i].pxTopOfStack;
+            if (c->running || !esp_stack_ptr_is_sane(x->a1)) continue;
             f.pc = x->pc; f.sp = x->a1; f.next_pc = x->a0;
         }
         c->pc[c->n++] = esp_cpu_process_stack_pc(f.pc);
@@ -81,9 +84,9 @@ void lastwords_die(const char *reason)
 {
     ESP_LOGE(TAG, "%s: recording every task and restarting", reason);
     stamp(&fresh, reason);
-    capture(&fresh);
     if (strikes_magic != MAGIC) { strikes_magic = MAGIC; strikes = 0; }
-    strikes = fresh.up_s < QUICK_S ? strikes + 1 : 1;
+    strikes = fresh.up_s < QUICK_S ? strikes + 1 : 1;       // counted first: should the walk below fall, this start still counts
+    capture(&fresh);
     esp_restart();
     for (;;) { }
 }
