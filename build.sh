@@ -10,10 +10,24 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BOARD="${1:-}"
 if [ "$BOARD" = all ]; then
-    for d in "$HERE"/*/CMakeLists.txt; do bash "$0" "$(basename "$(dirname "$d")")"; done
+    for d in "$HERE"/*/CMakeLists.txt; do
+        d="$(dirname "$d")"
+        if [ -d "$d/main/boards" ]; then for b in "$d"/main/boards/*.c; do bash "$0" "$(basename "$b" .c)"; done
+        else bash "$0" "$(basename "$d")"; fi
+    done
     exit 0
 fi
-[ -n "$BOARD" ] && [ -f "$HERE/$BOARD/CMakeLists.txt" ] || { echo "Usage: bash build.sh <board> [clean|menuconfig]"; ls -d "$HERE"/*/CMakeLists.txt 2>/dev/null | xargs -n1 dirname | xargs -n1 basename; exit 1; }
+# A board is a folder of its own (ai-speaker-mic, tdongle) or one of a family's boards
+# (cyd/main/boards/<board>.c: one program, built once per board, into build/<board>)
+DIR="$HERE/$BOARD"; FAMILY=""
+if [ -n "$BOARD" ] && [ ! -f "$DIR/CMakeLists.txt" ]; then
+    for f in "$HERE"/*/main/boards/"$BOARD".c; do [ -f "$f" ] && DIR="$(cd "$(dirname "$f")/../.." && pwd)" && FAMILY=yes; done
+fi
+[ -n "$BOARD" ] && [ -f "$DIR/CMakeLists.txt" ] || {
+    echo "Usage: bash build.sh <board> [clean|menuconfig]"
+    for d in "$HERE"/*/CMakeLists.txt; do d="$(dirname "$d")"; [ -d "$d/main/boards" ] && ls "$d"/main/boards/*.c | xargs -n1 basename | sed 's/\.c$//' || basename "$d"; done
+    exit 1
+}
 # With no IDF_PATH: an ESP-IDF unpacked beside this folder (../tmp/esp-idf-dl), the way Sapphire's own tree keeps it
 if [ -z "${IDF_PATH:-}" ]; then
     near=("$HERE"/../tmp/esp-idf-dl/esp-idf-v*)
@@ -29,13 +43,21 @@ if [ -z "${IDF_PYTHON_ENV_PATH:-}" ] && [ -n "${IDF_TOOLS_PATH:-}" ]; then
     [ ${#envs[@]} -eq 1 ] && [ -d "${envs[0]}" ] && export IDF_PYTHON_ENV_PATH="${envs[0]}"
 fi
 . "$IDF_PATH/export.sh" > /dev/null
-cd "$HERE/$BOARD"
+cd "$DIR"
+if [ -n "$FAMILY" ]; then
+    BUILD="build/$BOARD"
+    EXTRA=(-B "$BUILD" -D "BOARD=$BOARD" -D "SDKCONFIG=$DIR/$BUILD/sdkconfig")
+    NAME="$(sed -n 's|^// NAME: ||p' "main/boards/$BOARD.h" | head -1)"
+else
+    BUILD=build; EXTRA=(); NAME=""
+fi
 case "${2:-build}" in
-    clean) idf.py fullclean ;;
-    menuconfig) idf.py menuconfig ;;
-    *) if [ sdkconfig.defaults -nt sdkconfig ]; then      # idf.py keeps an old sdkconfig over newer defaults: start it over
-           echo "sdkconfig.defaults changed: the configuration starts over"; rm -f sdkconfig
+    clean) idf.py "${EXTRA[@]}" fullclean ;;
+    menuconfig) idf.py "${EXTRA[@]}" menuconfig ;;
+    *) if [ -f "$BUILD/sdkconfig" ] && [ sdkconfig.defaults -nt "$BUILD/sdkconfig" ] || [ -f sdkconfig ] && [ sdkconfig.defaults -nt sdkconfig ]; then
+           echo "sdkconfig.defaults changed: the configuration starts over"; rm -f "$BUILD/sdkconfig" sdkconfig   # idf.py keeps an old one over newer defaults
        fi
-       idf.py build                    # the target comes from sdkconfig.defaults
-       python "$HERE/tools/pack.py" "$BOARD" build "$HERE/dist" ;;
+       mkdir -p "$BUILD"
+       idf.py "${EXTRA[@]}" build       # the target comes from sdkconfig.defaults
+       python "$HERE/tools/pack.py" "$BOARD" "$BUILD" "$HERE/dist" ${NAME:+--name "$NAME"} ;;
 esac

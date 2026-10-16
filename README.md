@@ -8,8 +8,7 @@ so Sapphire shows only what a board says it has.
 | Folder | Board | State |
 |---|---|---|
 | `ai-speaker-mic/` | Waveshare ESP32-S3-AUDIO-Board: mics, speaker, light ring, optional screen and camera | works |
-| `cyd35/` | 3.5" Cheap Yellow Display, ESP32-3248S035C, capacitive touch (GT911) | works |
-| `cyd28/` | 2.8" Cheap Yellow Display, ESP32-2432S028R, resistive touch (XPT2046): landscape, a page at a time, a chat picker | works (first board 2026-10-15) |
+| `cyd/` | The reader, one program for two boards: `cyd28` (2.8" Cheap Yellow Display, ESP32-2432S028R, resistive XPT2046) and `cyd35` (3.5", ESP32-3248S035C, capacitive GT911). A page at a time, a chat picker, pages, rotation; `build.sh cyd28` or `cyd35` picks the board file under `cyd/main/boards/` | cyd28 works (2026-10-15); cyd35 built from the 0.4.5 pocket's glass and touch, eyes pending |
 | `tdongle/` | LilyGO T-Dongle-S3: a backup stick. A card for her backups, a small screen and an LED that say whether they are safe | works |
 
 ## Put it on a board
@@ -25,10 +24,10 @@ Needs [ESP-IDF v5.5](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/g
 on Linux, macOS or WSL. Set `IDF_PATH` to it, then:
 
 ```
-bash build.sh cyd35             one board
+bash build.sh cyd28             one board (a folder, or a board of a family: cyd28 and cyd35 are both cyd/)
 bash build.sh all               every board
-bash build.sh cyd35 clean
-bash build.sh cyd35 menuconfig
+bash build.sh cyd28 clean
+bash build.sh cyd28 menuconfig
 ```
 
 The first build downloads the board's components. Each build ends by writing
@@ -36,7 +35,7 @@ one file per board into `dist/` (`tools/pack.py`):
 
 ```
 dist/index.json                 every board here: version, chip, sha256, what sits where in its file
-dist/cyd35-0.3.0.bin            the whole board: bootloader, partition table, program
+dist/cyd28-0.5.0.bin            the whole board: bootloader, partition table, program
 ```
 
 To flash your own build from Sapphire, set **DEVICE_FIRMWARE_SOURCE** in her
@@ -55,7 +54,7 @@ Download your board's `.bin` from the latest release and write it at address
 0 with any ESP flasher:
 
 ```
-esptool.py write_flash 0x0 cyd35-0.3.0.bin
+esptool.py write_flash 0x0 cyd28-0.5.0.bin
 ```
 
 This also clears the board's saved name and WiFi, so it starts as a new
