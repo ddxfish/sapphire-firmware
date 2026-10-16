@@ -9,7 +9,7 @@ so Sapphire shows only what a board says it has.
 |---|---|---|
 | `ai-speaker-mic/` | Waveshare ESP32-S3-AUDIO-Board: mics, speaker, light ring, optional screen and camera | works |
 | `cyd35/` | 3.5" Cheap Yellow Display, ESP32-3248S035C, capacitive touch (GT911) | works |
-| `cyd28/` | 2.8" Cheap Yellow Display, ESP32-2432S028R, resistive touch (XPT2046) | not started |
+| `cyd28/` | 2.8" Cheap Yellow Display, ESP32-2432S028R, resistive touch (XPT2046): landscape, a page at a time, a chat picker | works (first board 2026-10-15) |
 | `tdongle/` | LilyGO T-Dongle-S3: a backup stick. A card for her backups, a small screen and an LED that say whether they are safe | works |
 
 ## Put it on a board
@@ -75,6 +75,10 @@ A board that keeps two program slots (`partitions.csv`) and says `firmware`
 in `/health` gets its updates over WiFi after the first flash.
 
 ## License
+
+The screens draw with Montserrat, compiled into LVGL's own component under
+the SIL Open Font License 1.1 (see its `COPYRIGHTS.md`); a font regenerated
+for a board here keeps that license beside it.
 
 The code here is under the GNU Affero General Public License v3 (`LICENSE`),
 like Sapphire.

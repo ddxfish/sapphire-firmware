@@ -23,6 +23,7 @@ typedef struct {
 bool mww_init(const mww_config_t *cfg);
 bool mww_feed(const int16_t *pcm, size_t samples);    // true the moment the word is heard
 void mww_reset(void);                                  // after a wake, or a pause
+float mww_last(void);                                  // the last window's average probability, 0 to 1 (what a fire scored)
 
 #ifdef __cplusplus
 }

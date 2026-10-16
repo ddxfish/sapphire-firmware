@@ -1,6 +1,7 @@
 // link.h - the board's side of the three doors on Sapphire:
 //   POST /api/devices/<name>/wake     at the wake word: may this board take it?
 //   POST /api/devices/<name>/voice    what it heard, after its wake word
+//   POST /api/devices/<name>/room     a piece of the room, while a capture goes on (capture.c)
 //   GET  /api/devices/<name>/events   held open: what its light should show, and what its buttons are set to
 //   POST /api/devices/<name>/press    a button set to send her a message was pressed
 // Sapphire is HTTPS with her own certificate. When the settings hold it, it
@@ -15,6 +16,12 @@ bool link_connected(void);
 // Sends a 16 kHz mono recording. True when Sapphire took it. `heard` gets
 // what she made of it, for the log.
 bool link_send_voice(const int16_t *pcm, size_t samples, char *heard, size_t heard_size);
+// A piece of the room: `chunk` is its number within capture `capture_id`, `fires` the JSON list of
+// [sample offset, score x 1000] of the wake fires in it (`n_fires` counts them all, listed or not).
+// Answers the HTTP status, 0 when Sapphire could not be reached, 204 when she took it but nobody
+// on her side is collecting (the capture should end).
+int link_send_room(const int16_t *pcm, size_t samples, const char *capture_id, int chunk, const char *fires,
+                   int n_fires, bool test, const char *model);
 // Asks for the wake that just fired. False only when Sapphire said another
 // listener has it (`taken_by` names it); when she cannot be asked, true.
 bool link_claim_wake(char *taken_by, size_t size);

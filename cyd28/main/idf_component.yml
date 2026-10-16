@@ -1,0 +1,7 @@
+## From Espressif's component registry. The ST7789 driver is in ESP-IDF itself (esp_lcd).
+dependencies:
+  idf: ">=5.5.3"
+  lvgl/lvgl: "^9.3"
+  espressif/esp_lvgl_port: "^2.6"
+  espressif/esp_lcd_ili9341: "^2.0"
+  espressif/mdns: "^1.4.0"

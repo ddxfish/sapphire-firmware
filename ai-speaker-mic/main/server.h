@@ -2,6 +2,7 @@
 //   GET  /health                     what this board is and how it is
 //   POST /audio/speak                a 16 kHz mono 16 bit WAV, played as it arrives
 //   GET  /audio/listen?max_seconds=  a recording, until the speaker stops
+//   GET/POST/DELETE /capture?seconds=&chunk=&test=   the room in pieces to Sapphire's room door, from its own task (capture.c)
 //   GET  /wakeword  POST /wakeword?enabled=true|false
 //   POST /power?action=restart|shutdown
 //   GET  /volume  POST /volume?level=0..100   the speaker, kept across restarts

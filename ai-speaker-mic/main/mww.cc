@@ -40,6 +40,7 @@ uint8_t recent[MAX_WINDOW];
 int recent_at;
 int stride_at;
 int settle;
+float last;                                  // the last window's average, for the capture's fire log
 
 bool frontend_init(int step_ms)
 {
@@ -129,6 +130,7 @@ bool slice(const uint16_t *values)
     if (settle > 0) { settle--; return false; }
     int sum = 0;
     for (int i = 0; i < window_size; i++) sum += recent[i];
+    last = sum / (255.0f * window_size);
     return sum > (int)cutoff * window_size;
 }
 
@@ -150,6 +152,8 @@ void mww_reset(void)
     settle = SETTLE_SLICES;
     if (interpreter) interpreter->Reset();
 }
+
+float mww_last(void) { return last; }
 
 bool mww_feed(const int16_t *pcm, size_t samples)
 {

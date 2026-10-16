@@ -1,0 +1,606 @@
+// link.c - see link.h.
+#include "link.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include "cJSON.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+#include "buttons.h"
+#include "light.h"
+#include "net.h"
+#include "ota.h"
+#include "settings.h"
+#include "ui.h"
+
+static const char *TAG = "link";
+static bool connected;
+static int last_refusal;
+#define TEXT_WAIT_MS 20000             // a typed question is answered once a turn has started
+#define PULL_WAIT_MS 15000
+#define EVENTS_QUIET_MS 45000          // a comment line arrives every 20 s
+#define EVENT_LINE 1536                // a "buttons" event with nine labelled buttons is ~600 bytes; a longer line is dropped, and logged
+#define PULL_MAX 700                   // chars a pull asks for; UTF-8 and JSON make it ~3 KB at most
+#define PULL_BUF 4096
+#define HIST_MAX 1500                  // bytes of text one history pull asks for (the server adds one whole message at least)
+#define HIST_BUF 5120
+#define TYPED_MAX 512
+
+// --- what is being written ---------------------------------------------------------------
+// The reply the board follows: its id, its revision, how much Sapphire has,
+// how much the board has. `wanted` is set by a doorbell and cleared by a pull.
+// Sapphire counts characters (`from`, `have`), so msg_mine does too; msg_bytes
+// is where the next piece goes in `reply`. Counting bytes for both lost the
+// end of any reply with a curly quote or a dash in it (0.4.2).
+
+static SemaphoreHandle_t lock;
+static char msg_id[24], msg_rev[12];
+static int msg_have, msg_mine, msg_bytes, msg_done;
+static char *reply;                    // the text so far, REPLY_MAX + 1
+static bool wanted;
+
+typedef struct { char kind; char text[TYPED_MAX]; } job_t;   // 't' typed text, 'p' pull, 'b' a button: "boot short", 'c' the chat list, 'C' a pick, 'h' history (text: the cursor, -1 = newest), 'A' an ask (text: the job)
+static QueueHandle_t jobs;
+static void get_history(int before);
+
+static void url_for(const char *door, char *out, size_t size)
+{
+    snprintf(out, size, "%s/api/devices/%s/%s", settings.sapphire, settings.name, door);
+}
+
+static esp_http_client_handle_t open_client(const char *door, esp_http_client_method_t method, int timeout_ms)
+{
+    char url[SETTING_MAX + 160], bearer[SETTING_MAX + 8];
+    url_for(door, url, sizeof url);
+    snprintf(bearer, sizeof bearer, "Bearer %s", settings.voice_key);
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = method,
+        .timeout_ms = timeout_ms,
+        .cert_pem = settings.cert[0] ? settings.cert : NULL,
+        .skip_cert_common_name_check = true,      // her certificate names no address
+        .buffer_size = 1024,
+        .buffer_size_tx = 1024,
+        .keep_alive_enable = false,
+    };
+    if (!settings.cert[0]) cfg.crt_bundle_attach = NULL;   // no certificate given at setup: not checked, as documented
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c) esp_http_client_set_header(c, "Authorization", bearer);
+    return c;
+}
+
+// the whole answer of a small request, or -1. `body` gets at most size-1 bytes.
+static int small_answer(esp_http_client_handle_t c, char *body, size_t size)
+{
+    if (esp_http_client_fetch_headers(c) < 0) { body[0] = 0; return -1; }
+    int total = 0;
+    while (total < (int)size - 1) {
+        int n = esp_http_client_read(c, body + total, size - 1 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    body[total] = 0;
+    return esp_http_client_get_status_code(c);
+}
+
+// --- typed text up ------------------------------------------------------------------------
+
+static void post_text(const char *text)
+{
+    esp_http_client_handle_t c = open_client("text", HTTP_METHOD_POST, TEXT_WAIT_MS);
+    if (!c) { ui_failed("not sent: no memory"); return; }
+    esp_http_client_set_header(c, "Content-Type", "text/plain; charset=utf-8");
+    size_t len = strlen(text);
+    bool ok = false;
+    char why[96] = "not sent: Sapphire did not answer";
+    if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, text, len) == (int)len) {
+        char body[512];
+        int status = small_answer(c, body, sizeof body);
+        cJSON *j = cJSON_Parse(body);
+        if (status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"))) {
+            ok = cJSON_IsTrue(cJSON_GetObjectItem(j, "accepted"));
+            if (!ok) strlcpy(why, "not taken: she is busy", sizeof why);
+        } else {
+            const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+            const cJSON *d = j ? cJSON_GetObjectItem(j, "detail") : NULL;
+            snprintf(why, sizeof why, "not sent: %s", cJSON_IsString(e) ? e->valuestring
+                     : cJSON_IsString(d) ? d->valuestring : status == 401 ? "wrong key, or not added yet" : "no answer");
+        }
+        cJSON_Delete(j);
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (!ok) { ui_failed(why); light_cue("error"); }
+}
+
+bool link_send_text(const char *text)
+{
+    if (!jobs || !net_up()) return false;
+    job_t job = {.kind = 't'};
+    strlcpy(job.text, text, sizeof job.text);
+    return xQueueSend(jobs, &job, 0) == pdTRUE;
+}
+
+// --- a button set to reach her ---------------------------------------------------------------
+
+static void post_press(char *press)
+{
+    char *how = strchr(press, ' ');
+    if (!how) return;
+    *how++ = 0;
+    esp_http_client_handle_t c = open_client("press", HTTP_METHOD_POST, TEXT_WAIT_MS);
+    if (!c) { ui_failed("not sent: no memory"); return; }
+    char out[64];
+    int len = snprintf(out, sizeof out, "{\"button\": \"%s\", \"how\": \"%s\"}", press, how);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    bool ok = false, taken = false;
+    char why[96] = "not sent: Sapphire did not answer";
+    if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == len) {
+        char *body = malloc(1024);                 // the message set for the press comes back, to show it
+        int status = body ? small_answer(c, body, 1024) : -1;
+        cJSON *j = body ? cJSON_Parse(body) : NULL;
+        if (status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"))) {
+            ok = true;
+            taken = cJSON_IsTrue(cJSON_GetObjectItem(j, "accepted"));
+            const cJSON *said = cJSON_GetObjectItem(j, "text");
+            if (taken && cJSON_IsString(said)) ui_mine(said->valuestring);
+        } else {
+            const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+            snprintf(why, sizeof why, "not sent: %s", cJSON_IsString(e) ? e->valuestring
+                     : status == 401 ? "wrong key, or not added yet" : "no answer");
+        }
+        cJSON_Delete(j);
+        free(body);
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (!ok) { ui_failed(why); light_cue("error"); }
+    else if (!taken) { light_cue("idle"); ui_status(""); }   // nothing is set for it on her side: no turn will come
+}
+
+void link_press(const char *button, const char *how)
+{
+    job_t job = {.kind = 'b'};
+    snprintf(job.text, sizeof job.text, "%s %s", button, how);
+    if (!jobs || !net_up() || xQueueSend(jobs, &job, 0) != pdTRUE) light_cue("error");
+}
+
+// --- the chat picker --------------------------------------------------------------------------
+
+static void get_chats(void)
+{
+    esp_http_client_handle_t c = open_client("chats", HTTP_METHOD_GET, PULL_WAIT_MS);
+    if (!c) return;
+    char *body = malloc(PULL_BUF);
+    if (!body) { esp_http_client_cleanup(c); return; }
+    int status = esp_http_client_open(c, 0) == ESP_OK ? small_answer(c, body, PULL_BUF) : -1;
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    cJSON *j = status == 200 ? cJSON_Parse(body) : NULL;
+    free(body);
+    if (!j) { ESP_LOGW(TAG, "chats answered %d%s", status, status == 404 ? " (a Sapphire without the picker's doors)" : ""); return; }
+    const cJSON *list = cJSON_GetObjectItem(j, "chats"), *now = cJSON_GetObjectItem(j, "chat"), *it;
+    size_t cap = 1;                                    // the names one a line, as the picker takes them
+    cJSON_ArrayForEach(it, list) if (cJSON_IsString(it)) cap += strlen(it->valuestring) + 1;
+    char *joined = malloc(cap);
+    if (joined) {
+        char *w = joined;
+        *w = 0;
+        cJSON_ArrayForEach(it, list) {
+            if (!cJSON_IsString(it) || !it->valuestring[0]) continue;
+            if (w != joined) *w++ = '\n';
+            size_t n = strlen(it->valuestring);
+            memcpy(w, it->valuestring, n);
+            w += n;
+            *w = 0;
+        }
+        ui_chats(joined, cJSON_IsString(now) ? now->valuestring : "");
+        free(joined);
+    }
+    cJSON_Delete(j);
+}
+
+static void post_chat(const char *name)
+{
+    esp_http_client_handle_t c = open_client("chat", HTTP_METHOD_POST, TEXT_WAIT_MS);
+    if (!c) return;
+    cJSON *ask = cJSON_CreateObject();
+    cJSON_AddStringToObject(ask, "name", name);
+    char *out = cJSON_PrintUnformatted(ask);
+    cJSON_Delete(ask);
+    if (!out) { esp_http_client_cleanup(c); return; }
+    size_t len = strlen(out);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    char why[96] = "could not pick that chat";
+    bool ok = false;
+    if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == (int)len) {
+        char body[512];
+        int status = small_answer(c, body, sizeof body);
+        cJSON *j = cJSON_Parse(body);
+        ok = status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"));
+        const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+        if (!ok && cJSON_IsString(e)) snprintf(why, sizeof why, "%s", e->valuestring);
+        cJSON_Delete(j);
+    }
+    cJSON_free(out);
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    if (!ok) { ui_toast(why, 6); get_chats(); }        // the list and the name set straight again
+    else get_history(-1);                              // the page opens on that chat
+    ESP_LOGI(TAG, "chat '%s': %s", name, ok ? "picked" : why);
+}
+
+static void get_history(int before)
+{
+    char door[64];
+    if (before >= 0) snprintf(door, sizeof door, "history?before=%d&max=%d", before, HIST_MAX);
+    else snprintf(door, sizeof door, "history?max=%d", HIST_MAX);
+    esp_http_client_handle_t c = open_client(door, HTTP_METHOD_GET, PULL_WAIT_MS);
+    char *body = c ? malloc(HIST_BUF) : NULL;
+    if (!body) { if (c) esp_http_client_cleanup(c); ui_history_fail(); return; }
+    int status = esp_http_client_open(c, 0) == ESP_OK ? small_answer(c, body, HIST_BUF) : -1;
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    cJSON *j = status == 200 ? cJSON_Parse(body) : NULL;
+    free(body);
+    if (!j || !cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"))) {
+        ESP_LOGW(TAG, "history answered %d%s", status, status == 404 ? " (a Sapphire without the door)" : "");
+        cJSON_Delete(j);
+        ui_history_fail();
+        return;
+    }
+    const cJSON *list = cJSON_GetObjectItem(j, "messages"), *cursor = cJSON_GetObjectItem(j, "before"), *it;
+    ui_history_begin(before < 0);
+    cJSON_ArrayForEach(it, list) {
+        const cJSON *who = cJSON_GetObjectItem(it, "who"), *text = cJSON_GetObjectItem(it, "text");
+        if (cJSON_IsString(text) && text->valuestring[0])
+            ui_history_add(cJSON_IsString(who) && !strcmp(who->valuestring, "her"), text->valuestring);
+    }
+    ui_history_end(cJSON_IsNumber(cursor) ? (int)cursor->valuedouble : 0);
+    cJSON_Delete(j);
+}
+
+static bool hist_queued;               // an 'h' job waits already: a second tap on Reload adds none
+
+void link_ask_history(int before)
+{
+    if (hist_queued) return;
+    job_t job = {.kind = 'h'};
+    snprintf(job.text, sizeof job.text, "%d", before);
+    hist_queued = jobs && net_up() && xQueueSend(jobs, &job, 0) == pdTRUE;
+    if (!hist_queued) ui_history_fail();
+}
+
+static void post_ask(const char *job)
+{
+    esp_http_client_handle_t c = open_client("ask", HTTP_METHOD_POST, TEXT_WAIT_MS);
+    if (!c) { ui_toast("no memory to ask", 4); return; }
+    char out[64];
+    int len = snprintf(out, sizeof out, "{\"job\": \"%s\"}", job);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    char why[96] = "Sapphire did not answer";
+    if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == len) {
+        char body[512];
+        int status = small_answer(c, body, sizeof body);
+        cJSON *j = cJSON_Parse(body);
+        const cJSON *said = j ? cJSON_GetObjectItem(j, "said") : NULL;
+        const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+        if (status == 200 && cJSON_IsString(said)) snprintf(why, sizeof why, "%s", said->valuestring);
+        else if (cJSON_IsString(e)) snprintf(why, sizeof why, "%s", e->valuestring);
+        else if (status == 404) strcpy(why, "this Sapphire has no such job");
+        cJSON_Delete(j);
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    ui_toast(why, 5);
+}
+
+void link_ask(const char *job)
+{
+    job_t ask = {.kind = 'A'};
+    strlcpy(ask.text, job ? job : "", sizeof ask.text);
+    if (!jobs || !net_up() || !ask.text[0] || xQueueSend(jobs, &ask, 0) != pdTRUE) ui_toast("no link to ask", 4);
+}
+
+void link_ask_chats(void)
+{
+    job_t job = {.kind = 'c', .text = {0}};
+    if (jobs && net_up()) xQueueSend(jobs, &job, 0);
+}
+
+void link_pick_chat(const char *name)
+{
+    job_t job = {.kind = 'C'};
+    strlcpy(job.text, name ? name : "", sizeof job.text);
+    if (!jobs || !net_up() || !job.text[0] || xQueueSend(jobs, &job, 0) != pdTRUE) ui_toast("no link: the chat was not picked", 6);
+}
+
+// --- her words down -------------------------------------------------------------------------
+
+// Sapphire sends `rev` as a number (an older core sent a string): digits either way.
+static bool rev_text(const cJSON *rev, char *out, size_t size)
+{
+    if (cJSON_IsNumber(rev)) { snprintf(out, size, "%d", (int)rev->valuedouble); return true; }
+    if (cJSON_IsString(rev)) { strlcpy(out, rev->valuestring, size); return true; }
+    return false;
+}
+
+// A pull is queued, or `wanted` is let go of: `wanted` with no job behind it
+// left the board deaf to every reply until a reboot (a full queue, 2026-10-16).
+static void ask_pull(void)
+{
+    job_t job = {.kind = 'p'};
+    if (xQueueSend(jobs, &job, 0) == pdTRUE) return;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    wanted = false;
+    xSemaphoreGive(lock);
+    ESP_LOGW(TAG, "the jobs queue is full: a pull was dropped");
+}
+
+static void pull(void)
+{
+    char id[24], rev[12];
+    int from;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    strlcpy(id, msg_id, sizeof id);
+    strlcpy(rev, msg_rev, sizeof rev);
+    from = msg_mine;
+    bool full = msg_bytes >= REPLY_MAX;
+    wanted = false;
+    xSemaphoreGive(lock);
+    if (!id[0] || full) return;
+
+    char door[96];
+    snprintf(door, sizeof door, "text?msg=%s&rev=%s&from=%d&max=%d", id, rev, from, PULL_MAX);
+    esp_http_client_handle_t c = open_client(door, HTTP_METHOD_GET, PULL_WAIT_MS);
+    if (!c) return;
+    char *body = malloc(PULL_BUF);
+    if (!body) { esp_http_client_cleanup(c); return; }
+    int status = esp_http_client_open(c, 0) == ESP_OK ? small_answer(c, body, PULL_BUF) : -1;
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    cJSON *j = status == 200 ? cJSON_Parse(body) : NULL;
+    free(body);
+    if (!j) { ESP_LOGW(TAG, "pull of %s from %d answered %d", id, from, status); return; }
+    const cJSON *got_id = cJSON_GetObjectItem(j, "msg");
+    const cJSON *got_rev = cJSON_GetObjectItem(j, "rev");
+    const cJSON *text = cJSON_GetObjectItem(j, "text");
+    const cJSON *at = cJSON_GetObjectItem(j, "from");
+    const cJSON *have = cJSON_GetObjectItem(j, "have");
+    bool changed = false;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (cJSON_IsString(got_id) && !strcmp(got_id->valuestring, msg_id)) {
+        char got_text[12];
+        int got = rev_text(got_rev, got_text, sizeof got_text) ? atoi(got_text) : 0, mine = atoi(msg_rev);
+        if (got < mine) {
+            // an older revision, answered after a newer doorbell: stale, dropped. The pull
+            // for the new one is queued already (a rewind here made two bubbles, 2026-10-06)
+        } else if (got > mine) {
+            snprintf(msg_rev, sizeof msg_rev, "%d", got);   // newer than any doorbell said: from the start
+            msg_mine = msg_bytes = 0;
+            reply[0] = 0;
+            wanted = true;
+        } else if (cJSON_IsString(text) && cJSON_IsNumber(at) && (int)at->valuedouble == msg_mine) {
+            const char *t = text->valuestring;
+            size_t room = REPLY_MAX - msg_bytes, n = strlen(t);
+            bool cut = n > room;                              // the screen's limit: no more is asked for
+            if (cut) { n = room; while (n > 0 && (t[n] & 0xC0) == 0x80) n--; }   // never half a character
+            memcpy(reply + msg_bytes, t, n);
+            reply[msg_bytes + n] = 0;
+            msg_bytes = cut ? REPLY_MAX : msg_bytes + n;
+            for (size_t i = 0; i < n; i++) if ((t[i] & 0xC0) != 0x80) msg_mine++;
+            changed = n > 0;
+            if (cJSON_IsNumber(have)) msg_have = (int)have->valuedouble;
+            if (msg_mine < msg_have && msg_bytes < REPLY_MAX && n > 0) wanted = true;   // more than one pull's worth: again
+        }
+    }
+    if (changed) ui_reply_set(reply);     // under the lock: a doorbell for the next message cannot empty `reply` under it
+    xSemaphoreGive(lock);
+    cJSON_Delete(j);
+}
+
+static void doorbell(const cJSON *j)
+{
+    const cJSON *id = cJSON_GetObjectItem(j, "msg");
+    const cJSON *rev = cJSON_GetObjectItem(j, "rev");
+    const cJSON *have = cJSON_GetObjectItem(j, "have");
+    const cJSON *done = cJSON_GetObjectItem(j, "done");
+    if (!cJSON_IsString(id)) return;
+    bool fresh = false, ring = false;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    char rev_now[12];
+    bool has_rev = rev_text(rev, rev_now, sizeof rev_now);
+    if (strcmp(id->valuestring, msg_id)) {
+        strlcpy(msg_id, id->valuestring, sizeof msg_id);
+        strlcpy(msg_rev, has_rev ? rev_now : "0", sizeof msg_rev);
+        msg_mine = msg_bytes = msg_have = msg_done = 0;
+        reply[0] = 0;
+        fresh = true;
+    } else if (has_rev && strcmp(rev_now, msg_rev)) {
+        strlcpy(msg_rev, rev_now, sizeof msg_rev);    // her text was rewritten (a tool round joined, thinking cut): from the start
+        msg_mine = msg_bytes = 0;
+        reply[0] = 0;
+    }
+    if (cJSON_IsNumber(have)) msg_have = (int)have->valuedouble;
+    if (cJSON_IsTrue(done)) msg_done = 1;
+    if (msg_mine < msg_have && msg_bytes < REPLY_MAX && !wanted) { wanted = true; ring = true; }
+    xSemaphoreGive(lock);
+    if (fresh) ui_reply_begin();
+    if (ring) ask_pull();
+}
+
+static void take_line(const char *line)
+{
+    if (strncmp(line, "data: ", 6)) return;
+    cJSON *j = cJSON_Parse(line + 6);
+    const cJSON *state = j ? cJSON_GetObjectItem(j, "state") : NULL;
+    if (cJSON_IsString(state)) {
+        const char *s = state->valuestring;
+        if (!strcmp(s, "connected")) {
+            connected = true;
+            last_refusal = 0;
+            const cJSON *now = cJSON_GetObjectItem(j, "now");
+            const cJSON *tz = cJSON_GetObjectItem(j, "tz");
+            if (cJSON_IsString(tz) && tz->valuestring[0]) { setenv("TZ", tz->valuestring, 1); tzset(); }
+            if (cJSON_IsNumber(now)) {
+                struct timeval tv = {.tv_sec = (time_t)now->valuedouble};
+                settimeofday(&tv, NULL);
+            }
+            ESP_LOGI(TAG, "events stream open%s", cJSON_IsNumber(now) ? ", clock set" : "");
+            ota_fine();                                        // a program on trial that reaches Sapphire is kept
+            xSemaphoreTake(lock, portMAX_DELAY);
+            wanted = false;                                    // a new stream: nothing of the old one is still coming
+            xSemaphoreGive(lock);
+            light_cue_from_brain("idle");
+            ui_link(true);
+            ui_status("");
+            job_t job = {.kind = 'c', .text = {0}};            // the picker's list, for this link
+            xQueueSend(jobs, &job, 0);
+            link_ask_history(-1);                              // and the chat read back, so the page opens on it
+        }
+        else if (!strcmp(s, "text")) doorbell(j);
+        else if (!strcmp(s, "buttons")) { buttons_bound(cJSON_GetObjectItem(j, "bound")); ui_button_labels(cJSON_GetObjectItem(j, "labels")); }
+        else if (!strcmp(s, "thinking")) { light_cue_from_brain(s); ui_status("thinking"); }
+        else if (!strcmp(s, "tool")) {
+            const cJSON *name = cJSON_GetObjectItem(j, "tool_name");
+            char text[48];
+            snprintf(text, sizeof text, "%s", cJSON_IsString(name) && name->valuestring[0] ? name->valuestring : "a tool");
+            light_cue_from_brain(s);
+            ui_status(text);
+        }
+        else if (!strcmp(s, "idle") || !strcmp(s, "error")) {
+            light_cue_from_brain(s);
+            ui_status(!strcmp(s, "error") ? "no answer" : "");
+            if (!strcmp(s, "idle")) {
+                xSemaphoreTake(lock, portMAX_DELAY);
+                bool behind = msg_id[0] && msg_mine < msg_have && msg_bytes < REPLY_MAX && !wanted;
+                if (behind) wanted = true;
+                xSemaphoreGive(lock);
+                if (behind) ask_pull();
+            }
+            job_t job = {.kind = 'd', .text = {0}};           // after any pull in the queue: close the bubble
+            xQueueSend(jobs, &job, 0);
+        }
+    }
+    cJSON_Delete(j);
+}
+
+static void hold_events(void)
+{
+    esp_http_client_handle_t c = open_client("events", HTTP_METHOD_GET, EVENTS_QUIET_MS);
+    if (!c) return;
+    esp_err_t opened = esp_http_client_open(c, 0);
+    int64_t length = opened == ESP_OK ? esp_http_client_fetch_headers(c) : -1;
+    if (opened == ESP_OK && length >= 0 && esp_http_client_get_status_code(c) == 200) {
+        // One byte at a time: esp_http_client_read() only returns when the
+        // buffer it was given is full or the stream ends. The stream is tiny.
+        static char line[EVENT_LINE];                      // one events task: off its stack
+        size_t have = 0;
+        bool cut = false;
+        for (;;) {
+            char ch;
+            int n = esp_http_client_read(c, &ch, 1);
+            if (n <= 0) { ESP_LOGW(TAG, "events stream ended (%d)", n); break; }
+            if (ch == '\n') {
+                line[have] = 0;
+                if (cut) ESP_LOGW(TAG, "an event line past %d bytes was dropped", EVENT_LINE);
+                else take_line(line);
+                have = 0;
+                cut = false;
+            }
+            else if (have < sizeof line - 1) line[have++] = ch;
+            else cut = true;
+        }
+    } else {
+        int status = esp_http_client_get_status_code(c);
+        if (status != last_refusal) {
+            last_refusal = status;
+            ESP_LOGW(TAG, "events stream refused: %d%s", status,
+                     status == 401 ? " (not added in Settings > Devices yet, or a wrong key)" : "");
+            ui_status(status == 401 ? "not added yet" : "no link");
+        }
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+}
+
+static void events_task(void *arg)
+{
+    int pause = 1;
+    for (;;) {
+        if (net_up()) {
+            hold_events();
+            if (connected) pause = 1;                      // a stream that was up: the next try is soon, not after the old backoff
+            connected = false;
+            ui_link(false);
+            light_cue("nolink");
+        }
+        vTaskDelay(pdMS_TO_TICKS(pause * 1000));
+        pause = pause < 30 ? pause * 2 : 30;
+        if (net_up() && pause > 8) pause = 8;
+    }
+}
+
+static void client_task(void *arg)
+{
+    job_t job;
+    for (;;) {
+        if (xQueueReceive(jobs, &job, portMAX_DELAY) != pdTRUE) continue;
+        if (job.kind == 't') { light_cue("thinking"); ui_status("sending"); post_text(job.text); }
+        else if (job.kind == 'b') { light_cue("thinking"); ui_status("sending"); ui_wake(); post_press(job.text); }
+        else if (job.kind == 'c') get_chats();
+        else if (job.kind == 'C') post_chat(job.text);
+        else if (job.kind == 'h') { hist_queued = false; get_history(atoi(job.text)); }
+        else if (job.kind == 'A') post_ask(job.text);
+        else if (job.kind == 'p') {
+            pull();
+            bool again;
+            xSemaphoreTake(lock, portMAX_DELAY);
+            again = wanted;
+            xSemaphoreGive(lock);
+            if (again) ask_pull();
+        }
+        else if (job.kind == 'd') {
+            bool behind, pending;
+            xSemaphoreTake(lock, portMAX_DELAY);
+            pending = wanted;
+            behind = msg_id[0] && msg_mine < msg_have && msg_bytes < REPLY_MAX;
+            if (behind) wanted = true;
+            xSemaphoreGive(lock);
+            if ((behind || pending) && job.text[0] < 6) {    // the last pieces first, then done again
+                if (!pending) pull();
+                job.text[0]++;
+                xQueueSend(jobs, &job, 0);
+            } else {
+                xSemaphoreTake(lock, portMAX_DELAY);
+                wanted = false;                            // nothing is coming for it: the next doorbell rings a pull again
+                xSemaphoreGive(lock);
+                ui_reply_done();
+            }
+        }
+    }
+}
+
+void link_start(void)
+{
+    static bool started;
+    if (started) return;
+    started = true;
+    lock = xSemaphoreCreateMutex();
+    reply = calloc(REPLY_MAX + 1, 1);
+    jobs = xQueueCreate(6, sizeof(job_t));
+    esp_log_level_set("esp-tls-mbedtls", ESP_LOG_ERROR);    // "skip_common_name" is by design, every time
+    xTaskCreatePinnedToCore(events_task, "events", 6144, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(client_task, "client", 6144, NULL, 4, NULL, 1);
+}
+
+bool link_connected(void) { return connected; }

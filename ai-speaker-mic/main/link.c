@@ -36,6 +36,7 @@ static int last_refusal;               // the events door's last status, said on
 #define EVENT_LINE 1024
 #define VOICE_ANSWER 8192              // the voice door's answer, with all she heard in it
 #define PRESS_WAIT_MS 15000            // answered once a turn has started
+#define ROOM_WAIT_MS 20000             // a piece of the room is a megabyte: seconds over WiFi, never a minute
 
 typedef struct { char button[16], how[8], job[16]; } press_t;   // job set: not a press, work asked of Sapphire (link_ask)
 static QueueHandle_t presses;
@@ -112,6 +113,59 @@ bool link_send_voice(const int16_t *pcm, size_t samples, char *heard, size_t hea
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
     return ok;
+}
+
+// --- a piece of the room (capture.c) ---------------------------------------------------
+
+int link_send_room(const int16_t *pcm, size_t samples, const char *capture_id, int chunk, const char *fires,
+                   int n_fires, bool test, const char *model)
+{
+    if (!net_up()) return 0;
+    esp_http_client_handle_t c = open_client("room", HTTP_METHOD_POST, ROOM_WAIT_MS);
+    if (!c) return 0;
+    char text[16];
+    esp_http_client_set_header(c, "Content-Type", "audio/wav");
+    esp_http_client_set_header(c, "X-Capture", capture_id);
+    snprintf(text, sizeof text, "%d", chunk);
+    esp_http_client_set_header(c, "X-Chunk", text);
+    esp_http_client_set_header(c, "X-Fires", fires);
+    char count[16];
+    snprintf(count, sizeof count, "%d", n_fires);
+    esp_http_client_set_header(c, "X-Fire-Count", count);
+    esp_http_client_set_header(c, "X-Test", test ? "1" : "0");
+    esp_http_client_set_header(c, "X-Model", model ? model : "");
+    size_t bytes = samples * 2;
+    int status = 0;
+    if (esp_http_client_open(c, WAV_HEADER + bytes) == ESP_OK) {
+        uint8_t head[WAV_HEADER];
+        wav_header(head, AUDIO_RATE, 1, bytes);
+        bool ok = esp_http_client_write(c, (char *)head, WAV_HEADER) == WAV_HEADER;
+        for (size_t at = 0; ok && at < bytes; at += 4096) {
+            size_t n = bytes - at < 4096 ? bytes - at : 4096;
+            ok = esp_http_client_write(c, (const char *)pcm + at, n) == (int)n;
+        }
+        if (ok && esp_http_client_fetch_headers(c) >= 0) {
+            status = esp_http_client_get_status_code(c);
+            char body[256] = {0};
+            int n = esp_http_client_read_response(c, body, sizeof body - 1);
+            if (n > 0) body[n] = 0;
+            if (status == 200) {
+                cJSON *j = cJSON_Parse(body);
+                if (j && cJSON_IsFalse(cJSON_GetObjectItem(j, "accepted"))) status = 204;   // taken, nobody collecting
+                else if (j && cJSON_IsFalse(cJSON_GetObjectItem(j, "ok"))) status = 500;     // her side had trouble: try the next piece
+                cJSON_Delete(j);
+            } else {
+                ESP_LOGW(TAG, "room door answered %d: %.160s", status, body);
+            }
+        } else {
+            ESP_LOGW(TAG, "a piece of the room did not reach Sapphire");
+        }
+    } else {
+        ESP_LOGW(TAG, "could not reach Sapphire at %s", settings.sapphire);
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    return status;
 }
 
 // --- the wake: may this board take it? -------------------------------------------------

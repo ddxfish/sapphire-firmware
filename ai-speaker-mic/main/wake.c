@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 
 #include "audio.h"
+#include "capture.h"
 #include "light.h"
 #include "link.h"
 #include "mww.h"
@@ -188,6 +189,7 @@ static void end(bool spoke)
 
 static void on_audio(const int16_t *pcm, size_t samples, bool speech)
 {
+    capture_feed(pcm, samples);                    // the room in pieces to Sapphire, while a capture goes on (0.7.6)
     for (size_t i = 0; i < samples; i++) {         // always: the pre-roll ring
         ring[ring_at] = pcm[i];
         ring_at = (ring_at + 1) % PREROLL;
@@ -195,6 +197,8 @@ static void on_audio(const int16_t *pcm, size_t samples, bool speech)
     if (state == IDLE) {
         if (forget) { forget = false; mww_reset(); }
         if (enabled && !paused && mww_feed(pcm, samples)) {
+            capture_fire(mww_last());                 // stamped into the piece it fell in, with its score
+            if (capture_test()) { ESP_LOGI(TAG, "wake word (counted only: a capture in test mode)"); return; }
             ESP_LOGI(TAG, "wake word");
             begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
         }

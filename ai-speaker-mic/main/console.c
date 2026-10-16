@@ -70,6 +70,23 @@ static void cmd_show(void)
     answer(j);
 }
 
+// The battery's pin as it is, whether or not it is a battery (0.7.5): the raw count, the
+// pin's millivolts, the cell's, and how far 16 reads jumped. A floating pin shows here too.
+static void cmd_battery(void)
+{
+    board_battery_t b;
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "gpio", BOARD_BATTERY_GPIO);
+    if (!board_battery_read(&b)) { cJSON_AddStringToObject(j, "error", "the ADC did not start"); answer(j); return; }
+    cJSON_AddNumberToObject(j, "raw", b.raw);
+    cJSON_AddNumberToObject(j, "pad_mv", b.pad_mv);
+    cJSON_AddNumberToObject(j, "mv", b.mv);
+    cJSON_AddNumberToObject(j, "spread_mv", b.spread_mv);
+    cJSON_AddBoolToObject(j, "battery", b.battery);
+    cJSON_AddNumberToObject(j, "percent", b.percent);
+    answer(j);
+}
+
 static void cmd_i2c(void)
 {
     cJSON *j = cJSON_CreateObject();
@@ -184,6 +201,7 @@ static void console_task(void *arg)
         else if (!strcmp(line, "selftest")) cmd_selftest();
         else if (!strcmp(line, "tasks")) answer(stats_tasks());
         else if (!strcmp(line, "i2c")) cmd_i2c();
+        else if (!strcmp(line, "battery")) cmd_battery();
         else if (!strcmp(line, "heap")) cmd_heap();
         else if (!strcmp(line, "where")) answer(lastwords_where());
         // the two ways down, on purpose, to see that each is caught and told (0.5.2)

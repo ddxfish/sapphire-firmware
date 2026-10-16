@@ -33,6 +33,9 @@ cd "$HERE/$BOARD"
 case "${2:-build}" in
     clean) idf.py fullclean ;;
     menuconfig) idf.py menuconfig ;;
-    *) idf.py build                    # the target comes from sdkconfig.defaults
+    *) if [ sdkconfig.defaults -nt sdkconfig ]; then      # idf.py keeps an old sdkconfig over newer defaults: start it over
+           echo "sdkconfig.defaults changed: the configuration starts over"; rm -f sdkconfig
+       fi
+       idf.py build                    # the target comes from sdkconfig.defaults
        python "$HERE/tools/pack.py" "$BOARD" build "$HERE/dist" ;;
 esac

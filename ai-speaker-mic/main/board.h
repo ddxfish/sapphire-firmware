@@ -113,3 +113,22 @@ void board_glass_orient(bool invert, bool flip);   // the panel's colors, landsc
 #define BOARD_CAM_D6 47
 #define BOARD_CAM_D7 48
 void board_camera_power(bool on);      // EXIO5; false when the expander is not up
+
+// --- the battery (0.7.5): a 3.7 V cell on the MX1.25 plug, an ETA6098 charger. Schematic
+// 1.1: BAT -> 200K -> BAT_ADC -> 100K -> GND, so the pin sees a third of the cell, taken
+// before the battery switch. BAT_ADC reaches the chip only through solder jumper R78: one
+// side is GPIO6 (ADC1 channel 5, free here: LCD_SDA3 is a QSPI panel line and the ST7789 is
+// plain SPI), the other, through R53, GPIO1 in place of the camera's HREF (Waveshare's
+// documented way: no camera, never). Read on GPIO6. A board whose R78 is open reads a
+// floating pin, out of a cell's range or jumping, and claims no battery.
+#define BOARD_BATTERY_GPIO 6
+#define BOARD_BATTERY_DIVIDER 3
+typedef struct {
+    int raw;                           // the ADC's mean of 16 reads, 0..4095
+    int pad_mv;                        // at the pin, by the chip's own calibration curve
+    int mv;                            // the cell: pad_mv times the divider
+    int spread_mv;                     // the cell, highest read less lowest: a floating pin jumps
+    int percent;                       // 0..100 from a cell's resting curve; -1 when it is not a battery
+    bool battery;                      // in a cell's range and steady
+} board_battery_t;
+bool board_battery_read(board_battery_t *out);   // false when the ADC did not start

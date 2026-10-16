@@ -3,6 +3,8 @@
 #include "board.h"
 #include "settings.h"
 
+#include <string.h>
+
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_rom_sys.h"
@@ -16,6 +18,9 @@
 #include "es8311_codec.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_io_expander_tca95xx_16bit.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -163,8 +168,75 @@ static void bus_clear(int sda, int scl)
     gpio_reset_pin(scl);
 }
 
+// --- the battery: see board.h -----------------------------------------------------
+static adc_oneshot_unit_handle_t adc;
+static adc_cali_handle_t adc_cali;
+#define BATTERY_CHANNEL ADC_CHANNEL_5    // GPIO 6 (BOARD_BATTERY_GPIO)
+#define BATTERY_READS 16
+#define BATTERY_MIN_MV 2800              // under this nothing runs; over 4400 it is not a cell
+#define BATTERY_MAX_MV 4400
+#define BATTERY_STEADY_MV 120            // 16 reads of a cell behind 100 nF sit within this; a floating pin does not
+
+static void battery_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit = {.unit_id = ADC_UNIT_1};
+    if (adc_oneshot_new_unit(&unit, &adc) != ESP_OK) { adc = NULL; ESP_LOGW(TAG, "the ADC did not start: no battery reading"); return; }
+    // 0..3.1 V at the pin: a cell shows 0.9..1.5, a pin tied high shows 3.3 (so a wrong jumper is seen, not clipped)
+    adc_oneshot_chan_cfg_t ch = {.atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
+    adc_oneshot_config_channel(adc, BATTERY_CHANNEL, &ch);
+    adc_cali_curve_fitting_config_t cal = {.unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
+    if (adc_cali_create_scheme_curve_fitting(&cal, &adc_cali) != ESP_OK) adc_cali = NULL;   // then the raw count against the range, roughly
+}
+
+static int pad_mv(int raw)
+{
+    int mv;
+    if (adc_cali && adc_cali_raw_to_voltage(adc_cali, raw, &mv) == ESP_OK) return mv;
+    return raw * 3100 / 4095;
+}
+
+// A lithium cell's resting voltage against its charge, the usual curve. While it charges it reads high.
+static int battery_percent(int mv)
+{
+    static const int curve[][2] = {{4200, 100}, {4100, 90}, {4000, 78}, {3900, 62}, {3800, 45},
+                                   {3700, 25}, {3600, 12}, {3500, 5}, {3400, 2}, {3300, 0}};
+    const int n = sizeof curve / sizeof curve[0];
+    if (mv >= curve[0][0]) return 100;
+    for (int i = 1; i < n; i++) {
+        if (mv >= curve[i][0]) {
+            int v0 = curve[i][0], p0 = curve[i][1], v1 = curve[i - 1][0], p1 = curve[i - 1][1];
+            return p0 + (mv - v0) * (p1 - p0) / (v1 - v0);
+        }
+    }
+    return 0;
+}
+
+bool board_battery_read(board_battery_t *out)
+{
+    memset(out, 0, sizeof *out);
+    out->percent = -1;
+    if (!adc) return false;
+    int sum = 0, lo = 4095, hi = 0, n = 0;
+    for (int i = 0; i < BATTERY_READS; i++) {
+        int raw;
+        if (adc_oneshot_read(adc, BATTERY_CHANNEL, &raw) != ESP_OK) continue;
+        sum += raw; n++;
+        if (raw < lo) lo = raw;
+        if (raw > hi) hi = raw;
+    }
+    if (!n) return false;
+    out->raw = sum / n;
+    out->pad_mv = pad_mv(out->raw);
+    out->mv = out->pad_mv * BOARD_BATTERY_DIVIDER;
+    out->spread_mv = (pad_mv(hi) - pad_mv(lo)) * BOARD_BATTERY_DIVIDER;
+    out->battery = out->mv >= BATTERY_MIN_MV && out->mv <= BATTERY_MAX_MV && out->spread_mv <= BATTERY_STEADY_MV;
+    if (out->battery) out->percent = battery_percent(out->mv);
+    return true;
+}
+
 bool board_init(int rate)
 {
+    battery_init();                    // first: it needs no bus, and a bus that fails must not take it down
     i2c_master_bus_config_t bus = {.i2c_port = 0, .sda_io_num = GPIO_NUM_11, .scl_io_num = GPIO_NUM_10,
                                    .clk_source = I2C_CLK_SRC_DEFAULT};
     bus_clear(bus.sda_io_num, bus.scl_io_num);

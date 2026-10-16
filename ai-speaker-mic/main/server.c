@@ -23,6 +23,7 @@
 
 #include "audio.h"
 #include "camera.h"
+#include "capture.h"
 #include "light.h"
 #include "lastwords.h"
 #include "link.h"
@@ -111,6 +112,29 @@ static bool query_value(httpd_req_t *req, const char *name, char *out, size_t si
         && httpd_query_key_value(query, name, out, size) == ESP_OK;
 }
 
+// --- /sensors: what the board measures, now (0.7.5). The battery, only when the schematic's
+// jumper R78 lands the cell's divider on GPIO 6 (board.h); an open jumper reads a floating pin
+// and the object is empty. A name ends in its unit, as the protocol asks -------------------
+
+static cJSON *sensors_json(void)
+{
+    board_battery_t b;
+    if (!board_battery_read(&b) || !b.battery) return NULL;
+    cJSON *s = cJSON_CreateObject();
+    cJSON_AddNumberToObject(s, "battery_v", (b.mv / 10) / 100.0);
+    cJSON_AddNumberToObject(s, "battery_pct", b.percent);
+    return s;
+}
+
+static esp_err_t on_sensors(httpd_req_t *req)
+{
+    if (!let_in(req)) return ESP_OK;
+    cJSON *j = cJSON_CreateObject();
+    cJSON *s = sensors_json();
+    cJSON_AddItemToObject(j, "sensors", s ? s : cJSON_CreateObject());
+    return say_json(req, 200, j);
+}
+
 // --- /health -----------------------------------------------------------------------
 
 static esp_err_t on_health(httpd_req_t *req)
@@ -164,6 +188,11 @@ static esp_err_t on_health(httpd_req_t *req)
         cJSON_AddBoolToObject(cam, "on", camera_busy());         // powered only while a shot is taken
     }
     if (ota_can()) cJSON_AddItemToArray(has, cJSON_CreateString("firmware"));   // two slots: PUT /firmware (was inside the card's block until 0.3.2)
+    cJSON *sensors = sensors_json();                             // the battery (0.7.5), only when its jumper lands it on the pin
+    if (sensors) {
+        cJSON_AddItemToArray(has, cJSON_CreateString("sensors"));
+        cJSON_AddItemToObject(j, "sensors", sensors);            // name: number; Sapphire shows each as a reading
+    }
     if (storage_ok()) {
         cJSON_AddItemToArray(has, cJSON_CreateString("storage"));
         cJSON *st = cJSON_AddObjectToObject(j, "storage");
@@ -203,6 +232,7 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddBoolToObject(ww, "paused", wake_paused());         // a backup is landing: it hears nothing until that ends
     cJSON_AddStringToObject(ww, "model", wake_model_name());
     cJSON_AddStringToObject(ww, "format", "tflite");            // microWakeWord: the Wakeword Maker sends this family
+    cJSON_AddItemToObject(j, "capture", capture_json());         // the room in pieces (0.7.6): a board with this key has the door
     cJSON *link = cJSON_AddObjectToObject(j, "link");
     cJSON_AddBoolToObject(link, "connected", link_connected());
     cJSON_AddNumberToObject(j, "wifi_dbm", net_rssi());
@@ -512,6 +542,29 @@ static esp_err_t on_led_looks(httpd_req_t *req)
     cJSON_AddBoolToObject(out, "ok", true);
     cJSON_AddItemToObject(out, "spec", light_spec());
     return say_json(req, 200, out);
+}
+
+// --- /capture: the room in pieces to Sapphire (0.7.6) ---------------------------------------
+// POST ?seconds=36000&chunk=30&test=false begins; the board posts every piece to her room door from its own
+// task and keeps hearing its wake word. DELETE ends it. GET says how it goes; /health carries the same.
+
+static esp_err_t on_capture(httpd_req_t *req)
+{
+    if (!let_in(req)) return ESP_OK;
+    if (req->method == HTTP_DELETE) {
+        capture_stop();
+    } else if (req->method == HTTP_POST) {
+        char text[16];
+        int seconds = query_value(req, "seconds", text, sizeof text) ? atoi(text) : 3600;
+        int chunk = query_value(req, "chunk", text, sizeof text) ? atoi(text) : 30;
+        bool test = query_value(req, "test", text, sizeof text) && (text[0] == 't' || text[0] == '1');
+        char why[96];
+        if (!capture_start(seconds, chunk, test, why, sizeof why)) return refuse(req, 409, why);
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddItemToObject(j, "capture", capture_json());
+    return say_json(req, 200, j);
 }
 
 // --- /wakeword, /power, /sounds ------------------------------------------------------------
@@ -1201,7 +1254,7 @@ void server_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.stack_size = 6144;                    // internal RAM (its handlers save settings to flash); 2.8 KB is the most it has used
-    cfg.max_uri_handlers = 40;
+    cfg.max_uri_handlers = 48;
     // 5 and the server's own 3 of LWIP's 16: Sapphire keeps her connections open, and at the
     // default 7 of 10 she could hold every socket the board has, with none left for its own
     // question to her. Past 5 the least used idle one is closed (lru_purge_enable).
@@ -1220,9 +1273,13 @@ void server_start(void)
     task_in_psram(store_task, "store", 8192, 3, 1);   // under the server and the ring, off the WiFi core; card writes are not flash writes
     const httpd_uri_t routes[] = {
         {"/health", HTTP_GET, on_health, NULL},
+        {"/sensors", HTTP_GET, on_sensors, NULL},
         {"/audio/speak", HTTP_POST, on_speak, NULL},
         {"/audio/stop", HTTP_POST, on_stop, NULL},
         {"/audio/listen", HTTP_GET, on_listen, NULL},
+        {"/capture", HTTP_GET, on_capture, NULL},
+        {"/capture", HTTP_POST, on_capture, NULL},
+        {"/capture", HTTP_DELETE, on_capture, NULL},
         {"/wakeword", HTTP_GET, on_wakeword, NULL},
         {"/wakeword", HTTP_POST, on_wakeword, NULL},
         {"/wakeword/model", HTTP_PUT, on_wakeword_model, NULL},

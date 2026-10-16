@@ -19,6 +19,7 @@
 #include "board.h"
 #include "buttons.h"
 #include "camera.h"
+#include "capture.h"
 #include "console.h"
 #include "lastwords.h"
 #include "light.h"
@@ -166,6 +167,7 @@ void app_main(void)
     room("after WiFi");
     audio_start();
     wake_start();
+    capture_init();                      // the room in pieces to Sapphire (0.7.6): its sender task sleeps until asked
     room("after sound");
     storage_start();                   // the card: its CS line is on the expander
     if (settings.mute) audio_set_mute(true);            // as it was left
