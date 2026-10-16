@@ -59,7 +59,9 @@ WiFi. Sapphire mints the keys and learns the board's address when it calls in.
    invert 1`; if red and blue trade places: `screen bgr 1`. If TOP is at
    the bottom: `screen rotate 180`; if the text reads mirrored: `screen
    mirror 1`. On the 2.8": `python setup_board.py touch cal` and tap the
-   three crosses. `screen font 18` for bigger text (14 to 24).
+   three crosses. `screen font 18` for bigger text (14 to 24). Once the
+   board is added (step 5), rotation, invert and mirror live in its
+   Screen tab too, and a save there is what the board keeps.
 4. `python setup_board.py setup` - in your own terminal. WiFi, Sapphire's
    address, her certificate, the two keys.
 5. Settings > Devices > + Add Device > Satellite. Paste the address and the

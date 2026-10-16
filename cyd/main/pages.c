@@ -628,12 +628,16 @@ static void on_actions_gone(lv_event_t *e) { memset(vbtn, 0, sizeof vbtn); }
 lv_obj_t *page_actions_build(lv_obj_t *parent)
 {
     lv_obj_t *c = column(parent);
+    lv_obj_set_flex_grow(c, 1);            // the rest of the glass under the bar (ui.c says the same once this returns)
+    lv_obj_update_layout(c);               // laid out now, so its height can be measured
     lv_obj_t *g = grid(c);
     int cols = board_w() >= 300 ? 3 : 2, bw = (board_w() - 16 - 6 * (cols - 1)) / cols;   // three a row on a wide glass, two on a narrow
+    int rows = (VBUTTONS + cols - 1) / cols, bh = (lv_obj_get_content_height(c) - 8 * (rows - 1)) / rows;   // the tiles fill the height too (Krem, 2026-10-16)
+    if (bh < 44) bh = 44;                  // two lines of words: a glass shorter than that scrolls the page instead
     for (int i = 0; i < VBUTTONS; i++) {
         char words[VLABEL_MAX + 24];
         bool set = vbutton_words(i, words, sizeof words);
-        vbtn[i] = button(g, words, on_vbutton, (void *)(intptr_t)i, bw, 58);
+        vbtn[i] = button(g, words, on_vbutton, (void *)(intptr_t)i, bw, bh);
         lv_obj_t *l = lv_obj_get_child(vbtn[i], 0);
         lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(l, bw - 8);

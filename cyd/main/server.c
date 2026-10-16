@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 
 #include "board.h"
+#include "esp_lvgl_port.h"
 #include "buttons.h"
 #include "light.h"
 #include "link.h"
@@ -212,6 +213,8 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddNumberToObject(screen, "h", board_h());
     cJSON_AddStringToObject(screen, "format", "rgb565be");
     cJSON_AddNumberToObject(screen, "rotation", board()->rotation);   // 0, 90, 180, 270: PUT /screen/settings {"rotation"} turns the glass
+    cJSON_AddBoolToObject(screen, "invert", board()->invert);        // the glass variants (the test card says): PUT /screen/settings {"invert", "mirror"}
+    cJSON_AddBoolToObject(screen, "mirror", board()->mirror);
     if (board_touch_needs_cal()) cJSON_AddBoolToObject(screen, "calibrate", true);   // POST /screen/calibrate: a resistive glass
     cJSON_AddStringToObject(screen, "chat", ui_chat_name());    // the chat it shows; Sapphire sends it with POST /screen {"chat"}
     cJSON_AddStringToObject(screen, "brain", ui_brain_name());  // and the model: stated, so a differing one is sent too (the picker's list carries no model)
@@ -482,8 +485,9 @@ static void sleep_soon(void *arg)
     esp_deep_sleep_start();
 }
 
-// PUT /screen/settings {"rotation": 0|90|180|270, "home", "brightness"}: how the glass sits,
-// kept. The board restarts to draw that way; a card being written is left to finish first.
+// PUT /screen/settings {"rotation": 0|90|180|270, "home", "brightness", "invert", "mirror"}: how
+// the glass sits, kept. A turn restarts the board to draw that way (a card being written is left to
+// finish first); invert and mirror take effect at once, as the console's `screen` words do.
 static esp_err_t on_screen_settings(httpd_req_t *req)
 {
     if (!let_in(req)) return ESP_OK;
@@ -492,6 +496,8 @@ static esp_err_t on_screen_settings(httpd_req_t *req)
     const cJSON *rot = cJSON_GetObjectItem(in, "rotation");
     const cJSON *home = cJSON_GetObjectItem(in, "home");
     const cJSON *bright = cJSON_GetObjectItem(in, "brightness");
+    const cJSON *inv = cJSON_GetObjectItem(in, "invert");
+    const cJSON *mir = cJSON_GetObjectItem(in, "mirror");
     int want = cJSON_IsNumber(rot) ? (int)rot->valuedouble : -1;
     if (cJSON_IsNumber(rot) && want != 0 && want != 90 && want != 180 && want != 270) { cJSON_Delete(in); return refuse(req, 400, "rotation: 0, 90, 180 or 270"); }
     bool turn = want >= 0 && want != board()->rotation;
@@ -501,6 +507,16 @@ static esp_err_t on_screen_settings(httpd_req_t *req)
         settings.brightness = v < 10 ? 10 : v > 100 ? 100 : v;
         settings_save();
         board_backlight(settings.brightness);
+    }
+    if (cJSON_IsBool(inv) && cJSON_IsTrue(inv) != board()->invert) {   // only a change: each set is a flash write
+        if (ui_up()) lvgl_port_lock(0);    // the panel takes a command from one task at a time: never under LVGL's flush
+        board_set_invert(cJSON_IsTrue(inv));
+        if (ui_up()) lvgl_port_unlock();
+    }
+    if (cJSON_IsBool(mir) && cJSON_IsTrue(mir) != board()->mirror) {
+        if (ui_up()) lvgl_port_lock(0);
+        board_set_mirror(cJSON_IsTrue(mir));
+        if (ui_up()) { lvgl_port_unlock(); ui_repaint(); }   // what is on the glass was drawn the other way
     }
     cJSON_Delete(in);
     if (turn && storage_busy()) return refuse(req, 409, "the card is being written: save again when it is done");
@@ -512,6 +528,8 @@ static esp_err_t on_screen_settings(httpd_req_t *req)
     cJSON_AddNumberToObject(j, "rotation", board()->rotation);
     cJSON_AddStringToObject(j, "home", ui_home_name());
     cJSON_AddNumberToObject(j, "brightness", settings.brightness);
+    cJSON_AddBoolToObject(j, "invert", board()->invert);
+    cJSON_AddBoolToObject(j, "mirror", board()->mirror);
     cJSON_AddBoolToObject(j, "restarting", turn);
     return say_json(req, 200, j);
 }
