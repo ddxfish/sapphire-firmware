@@ -45,6 +45,8 @@ typedef struct {
 bool board_init(int rate);             // I2C, expander (amplifier on), I2S, both codecs
 board_audio_t *board_audio(void);
 void board_amplifier(bool on);
+int board_speaker_check(void);        // the expander's amplifier pin and the ES8311 read back, put back if a chip reset: -1 unreadable, 0 fine, 1 healed
+int board_speaker_heals(const char **last);   // how many times, and what was wrong the last time
 // The three keys (schematic 1.1, read 2026-10-10): Key1, Key2, Key3 on the
 // expander's EXIO9, 10, 11, each with 10K to 3V3 and pressed to ground. The
 // expander's interrupt line is not connected (R22 not fitted), so they are polled.

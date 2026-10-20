@@ -30,7 +30,7 @@ dependencies:
       type: service
     version: 0.8.0
   espressif/esp-dl:
-    component_hash: 3148b2692a2943d7e35401dc10a181b6ba83515ec70ef51499ac5d2593eef3e2
+    component_hash: 3608ac32875cb7fa93805fba2372619bde3d8a02cee47c622cf5e91a1308fe92
     dependencies:
     - name: espressif/dl_fft
       registry_url: https://components.espressif.com
@@ -56,7 +56,7 @@ dependencies:
     - esp32s2
     - esp32s3
     - esp32s31
-    version: 3.3.13
+    version: 3.3.14
   espressif/esp-nn:
     component_hash: f4633a02f05fef53b80de65ade1f733ebdef637e4c8b8be4eb11f5e27f6d9f3e
     dependencies:
@@ -209,7 +209,7 @@ dependencies:
     component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
     dependencies: []
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32
@@ -289,10 +289,11 @@ direct_dependencies:
 - espressif/esp_io_expander_tca95xx_16bit
 - espressif/esp_lcd_touch_cst816s
 - espressif/esp_lvgl_port
+- espressif/esp_new_jpeg
 - espressif/led_strip
 - espressif/mdns
 - idf
 - lvgl/lvgl
-manifest_hash: 2dbec6bc6c7434741a32fdf3936af0469218b63197eb0a4a4ca7dfbaf29ac711
+manifest_hash: 8b488afbf2f44ac65beb107ca21ebe4df1fd06a3750b32d1e2363a35caa1d461
 target: esp32s3
 version: 2.0.0

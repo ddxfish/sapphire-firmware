@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -20,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_jpeg_dec.h"
 
 #include "audio.h"
 #include "camera.h"
@@ -48,6 +50,8 @@ static httpd_handle_t server;
 #define HALT_HERE_MS 60000             // after a stop made on the board while her turn goes on: until it ends or a question is sent (server_reply_over), this at most
 static volatile bool cut;              // /audio/stop while a sentence plays
 static volatile bool speaking;
+static _Atomic size_t queued_bytes;    // sound taken in, waiting in PSRAM for the player
+static int late_last_ms, late_total_ms, late_count;     // a sentence that took longer to play than it is long (/health sound)
 static int64_t halted_until_ms;
 static QueueHandle_t speak_queue;      // /audio/speak runs on its own task: the server stays free to answer
 static QueueHandle_t store_queue;      // /storage PUT, GET and format: a minute each, off the server task too
@@ -158,12 +162,21 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddItemToArray(has, cJSON_CreateString("power"));
     cJSON_AddItemToArray(has, cJSON_CreateString("buttons"));   // BOOT (0.6.0): what each press is set to comes on the events stream
     cJSON_AddItemToObject(j, "buttons", buttons_json());
+    cJSON *sound = cJSON_AddObjectToObject(j, "sound");      // the play queue (0.7.7): late = played longer than it is long
+    cJSON_AddNumberToObject(sound, "queued_kb", queued_bytes / 1024);
+    cJSON_AddNumberToObject(sound, "late_last_ms", late_last_ms);
+    cJSON_AddNumberToObject(sound, "late_count", late_count);
+    cJSON_AddNumberToObject(sound, "late_total_ms", late_total_ms);
+    const char *deaf;
+    cJSON_AddNumberToObject(sound, "heals", board_speaker_heals(&deaf));   // a chip that reset under her voice, put back (board_speaker_check)
+    cJSON_AddStringToObject(sound, "heal_last", deaf);
     if (ui_ok()) {
         cJSON_AddItemToArray(has, cJSON_CreateString("screen"));
         cJSON *screen = cJSON_AddObjectToObject(j, "screen");    // what /screen/picture and /screen/background take
         cJSON_AddNumberToObject(screen, "w", BOARD_W);
         cJSON_AddNumberToObject(screen, "h", BOARD_H);
         cJSON_AddStringToObject(screen, "format", "rgb565be");
+        cJSON_AddBoolToObject(screen, "jpeg", true);                      // /screen/picture?format=jpeg also takes one JPEG
         cJSON_AddBoolToObject(screen, "on", ui_screen_on());
         cJSON_AddStringToObject(screen, "chat", ui_chat_name());          // the chat name it shows; core sends it with POST /screen {"chat": ...}
         cJSON_AddStringToObject(screen, "brain", ui_brain_name());
@@ -238,6 +251,7 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddNumberToObject(j, "wifi_dbm", net_rssi());
     cJSON_AddNumberToObject(j, "free_kb", esp_get_free_heap_size() / 1024);
     cJSON_AddNumberToObject(j, "free_internal_kb", heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    cJSON_AddNumberToObject(j, "free_internal_min_kb", heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024);   // the least it has been since boot
     cJSON_AddNumberToObject(j, "free_internal_largest_kb", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) / 1024);
     if (stats_idle(0) >= 0) {                                   // the idle share of each core over the last 2 s
         cJSON *cpu = cJSON_AddObjectToObject(j, "cpu");
@@ -272,50 +286,71 @@ static esp_err_t on_health(httpd_req_t *req)
 // the request to the speak task (httpd's async handlers) and the server goes
 // on answering: /audio/stop, /health, the light. Sentences queue in order.
 
+// A sentence is taken whole into PSRAM at WiFi speed, then played from there by
+// the player (0.7.7): a WiFi stall (battery, distance, a busy radio) can only
+// delay a sentence's start, never punch a hole in it, and the next sentence is
+// already waiting when one ends. Before, it played straight off the socket with
+// ~0.4 s of slack. A stop bumps `stop_gen`: what was queued before it is dropped.
+#define SPEAK_QUEUED_MAX (1536 * 1024)  // sound waiting to play, all of it: ~47 s at 16 kHz mono
+typedef struct { uint8_t *buf; size_t len, at, samples; int channels; unsigned gen; } sentence_t;
+#define SPEAK_ROOM_SLACK_S 10           // waiting for room: as long as what is queued plays, and this
+static QueueHandle_t play_queue;
+static _Atomic unsigned stop_gen;
+static volatile bool receiving;         // a sentence is being taken in: she is talking (server_talking)
+
+// Room for `len` more in the play queue: wait while what is queued plays, so a
+// reply made faster than she speaks is held back at the door (its sender waits
+// on this answer) and not refused. Before (0.7.7 first cut) a full queue was a
+// 503, which Sapphire takes for "stopped", and a long answer lost its end.
+// False on a stop meanwhile, or when it never makes room.
+static bool wait_for_room(size_t len, unsigned gen)
+{
+    int64_t until = esp_timer_get_time() + ((int64_t)queued_bytes / (AUDIO_RATE * 2) + SPEAK_ROOM_SLACK_S) * 1000000;
+    while (queued_bytes + len > SPEAK_QUEUED_MAX || !uxQueueSpacesAvailable(play_queue)) {
+        if (gen != stop_gen || esp_timer_get_time() > until) return false;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return true;
+}
+
 static void speak_work(httpd_req_t *req)
 {
-    if (!audio_take_speaker(pdMS_TO_TICKS(2000))) {
-        refuse(req, 409, "already playing something");
-        httpd_req_async_handler_complete(req);
-        return;
-    }
-    uint8_t *buf = malloc(SPEAK_CHUNK);
-    size_t left = req->content_len, have = 0;
-    wav_info_t info = {0};
-    bool headed = false, stopped = false;
+    size_t len = req->content_len;
+    bool stopped = esp_timer_get_time() / 1000 < halted_until_ms || wake_busy();   // the rest of a stopped reply, or a sentence while the board hears a question: taken, not played
+    unsigned gen = stop_gen;
+    uint8_t *buf = NULL;
     int problem = 0;
-    if (esp_timer_get_time() / 1000 < halted_until_ms || wake_busy()) {
-        stopped = true;                                  // the rest of a stopped reply, or a sentence while the board is hearing a question: taken, not played
-    } else {
-        cut = false;
-        speaking = true;
-        light_cue("speaking");
+    if (!stopped) {
+        receiving = true;
+        if (!len || len > SPEAK_QUEUED_MAX) problem = 413;
+        else if (!wait_for_room(len, gen)) { if (gen != stop_gen) stopped = true; else problem = 503; }
+        else if (!(buf = heap_caps_malloc(len, MALLOC_CAP_SPIRAM))) problem = 507;
     }
-    while (left > 0 && !problem) {
-        int n = httpd_req_recv(req, (char *)buf + have, SPEAK_CHUNK - have);
-        if (n <= 0) { problem = 400; break; }
-        left -= n;
-        have += n;
-        if (stopped) { have = 0; continue; }             // drained, so the connection stays clean
-        if (cut) { stopped = true; have = 0; continue; }
-        if (!headed) {
-            if (have < 64 && left > 0) continue;              // a header needs a few bytes
-            if (!wav_parse(buf, have, &info) || info.rate != AUDIO_RATE) { problem = 415; break; }
-            headed = true;
-            memmove(buf, buf + info.data_at, have - info.data_at);
-            have -= info.data_at;
-        }
-        size_t whole = have & ~(size_t)(2 * info.channels - 1);     // whole frames only
-        audio_play((int16_t *)buf, whole / 2, info.channels);
-        memmove(buf, buf + whole, have - whole);
-        have -= whole;
+    uint8_t drain[512];
+    for (size_t have = 0; have < len && !problem;) {
+        int n = httpd_req_recv(req, buf ? (char *)buf + have : (char *)drain,
+                               buf ? (len - have > SPEAK_CHUNK ? SPEAK_CHUNK : len - have) : sizeof drain);
+        if (n <= 0) problem = 400;
+        else have += n;
     }
-    if (speaking) audio_play_end();
-    speaking = false;
-    audio_give_speaker();
+    wav_info_t info = {0};
+    if (buf && !problem && (!wav_parse(buf, len, &info) || info.rate != AUDIO_RATE)) problem = 415;
+    if (buf && !problem) {
+        size_t data = wav_get32(buf + info.data_at - 4);              // the data chunk's own size: a chunk after it is not sound
+        if (data > len - info.data_at) data = len - info.data_at;
+        sentence_t s = {.buf = buf, .len = len, .at = info.data_at, .channels = info.channels, .gen = gen,
+                        .samples = (data / 2) & ~(size_t)(info.channels - 1)};
+        queued_bytes += len;
+        if (xQueueSend(play_queue, &s, pdMS_TO_TICKS(1000)) == pdTRUE) buf = NULL;
+        else { queued_bytes -= len; problem = 503; }
+    }
     free(buf);
-    light_speech_done();                       // the brain's cue while its turn goes on, else idle
+    receiving = false;
+    if (!problem && gen != stop_gen) stopped = true;      // a stop landed while it came in: the player drops it
     if (problem == 415) refuse(req, 415, "not a 16 kHz 16 bit PCM WAV");
+    else if (problem == 413) refuse(req, 413, "one sentence of up to 47 s");
+    else if (problem == 503) refuse(req, 503, "too much sound is waiting to play");
+    else if (problem == 507) refuse(req, 507, "no memory for the sound");
     else if (problem) refuse(req, 400, "the sound did not arrive whole");
     else {
         cJSON *j = cJSON_CreateObject();
@@ -324,6 +359,45 @@ static void speak_work(httpd_req_t *req)
         say_json(req, 200, j);
     }
     httpd_req_async_handler_complete(req);
+}
+
+static void play_task(void *arg)
+{
+    sentence_t s;
+    for (;;) {
+        if (xQueueReceive(play_queue, &s, portMAX_DELAY) != pdTRUE) continue;
+        bool play = s.gen == stop_gen;
+        if (play && !audio_take_speaker(pdMS_TO_TICKS(2000))) {
+            play = false;
+            ESP_LOGW(TAG, "the speaker stayed busy 2 s: a sentence of %u ms was dropped", (unsigned)(s.samples / s.channels * 1000 / AUDIO_RATE));
+        }
+        if (play) {
+            cut = false;
+            if (s.gen != stop_gen) { audio_give_speaker(); play = false; }   // a stop landed while it waited for the speaker
+        }
+        if (play) {
+            speaking = true;
+            light_cue("speaking");
+            int64_t t0 = esp_timer_get_time();
+            const int16_t *pcm = (const int16_t *)(s.buf + s.at);
+            size_t step = (SPEAK_CHUNK / 2) & ~(size_t)(s.channels - 1);
+            for (size_t done = 0; done < s.samples && !cut; done += step) {
+                size_t n = s.samples - done < step ? s.samples - done : step;
+                audio_play(pcm + done, n, s.channels);
+            }
+            audio_play_end();
+            if (!cut) {
+                int late = (int)((esp_timer_get_time() - t0) / 1000) - (int)(s.samples / s.channels * 1000 / AUDIO_RATE) - 50;
+                late_last_ms = late > 0 ? late : 0;
+                if (late > 40) { late_total_ms += late; late_count++; ESP_LOGW(TAG, "a sentence played %d ms late", late); }
+            }
+            speaking = false;
+            audio_give_speaker();
+        }
+        queued_bytes -= s.len;
+        free(s.buf);
+        if (!uxQueueMessagesWaiting(play_queue)) light_speech_done();   // the brain's cue while its turn goes on, else idle
+    }
 }
 
 static void speak_task(void *arg)
@@ -359,12 +433,13 @@ bool server_speaking(void) { return speaking; }
 // Sound is playing or waiting to. Between two sentences of a reply it is
 // light_turn_on() that says she is still at it; a timed tail here swallowed
 // the tap that answers her and refused a minute of speech (scout, 2026-10-11).
-bool server_talking(void) { return speaking || (speak_queue && uxQueueMessagesWaiting(speak_queue)); }
+bool server_talking(void) { return speaking || receiving || (speak_queue && uxQueueMessagesWaiting(speak_queue)) || (play_queue && uxQueueMessagesWaiting(play_queue)); }
 
 static bool stop_for(int ms)
 {
-    bool was = speaking;
-    cut = true;
+    bool was = speaking || (play_queue && uxQueueMessagesWaiting(play_queue));
+    stop_gen++;                                          // and every sentence queued before this stop: first,
+    cut = true;                                          // so the player cannot clear `cut` for a sentence this stop dooms
     halted_until_ms = esp_timer_get_time() / 1000 + ms;
     return was;
 }
@@ -383,7 +458,7 @@ bool server_stop_speech(void) { return stop_for(light_turn_on() ? HALT_HERE_MS :
 bool server_stop_by_hand(void)
 {
     bool turn = light_turn_on(), was = server_stop_speech();
-    if (turn) link_ask("stop");
+    if (turn || was) link_ask("stop");                  // an announcement too (0.7.7): it was answered when taken, so its "stopped" is told here
     return was;
 }
 
@@ -402,6 +477,45 @@ static esp_err_t on_stop(httpd_req_t *req)
 }
 
 // --- /audio/listen: record until the speaker stops, or (vad=false) the room for `seconds` -----
+// On its own task (0.7.7): a speak is answered once taken, so a `say` then a
+// listen arrived while she was still saying it, and the board recorded her
+// own voice. It waits here until she is done (bounded: Sapphire gives a listen
+// its seconds + 12), with the server free for a stop meanwhile.
+#define LISTEN_WAIT_S 10
+typedef struct { httpd_req_t *req; int max_s; bool vad; } listen_job_t;
+static QueueHandle_t listen_queue;
+
+static void listen_work(listen_job_t *job)
+{
+    httpd_req_t *req = job->req;
+    int64_t until = esp_timer_get_time() + LISTEN_WAIT_S * 1000000LL;
+    bool waited = false;
+    while (server_talking() && esp_timer_get_time() < until) { waited = true; vTaskDelay(pdMS_TO_TICKS(50)); }
+    if (waited) vTaskDelay(pdMS_TO_TICKS(150));          // her last words leave the DMA and the room
+    recording_t rec;
+    if (!wake_record_now(job->max_s, job->vad, &rec)) {
+        refuse(req, 409, "already listening for a question, or no sound is coming in from the microphones");
+    } else {
+        uint8_t head[WAV_HEADER];
+        wav_header(head, AUDIO_RATE, 1, rec.samples * 2);
+        httpd_resp_set_type(req, "audio/wav");
+        httpd_resp_send_chunk(req, (char *)head, WAV_HEADER);
+        for (size_t at = 0; at < rec.samples; at += SPEAK_CHUNK / 2) {
+            size_t n = rec.samples - at < SPEAK_CHUNK / 2 ? rec.samples - at : SPEAK_CHUNK / 2;
+            httpd_resp_send_chunk(req, (char *)(rec.pcm + at), n * 2);
+        }
+        httpd_resp_send_chunk(req, NULL, 0);
+        wake_record_done(&rec);
+    }
+    httpd_req_async_handler_complete(req);
+}
+
+static void listen_task(void *arg)
+{
+    listen_job_t job;
+    for (;;)
+        if (xQueueReceive(listen_queue, &job, portMAX_DELAY) == pdTRUE) listen_work(&job);
+}
 
 static esp_err_t on_listen(httpd_req_t *req)
 {
@@ -416,19 +530,11 @@ static esp_err_t on_listen(httpd_req_t *req)
         if (max_s < 1) max_s = 1;
         if (max_s > LISTEN_MAX_S) max_s = LISTEN_MAX_S;
     }
-    recording_t rec;
-    if (!wake_record_now(max_s, use_vad, &rec))
+    if (!uxQueueSpacesAvailable(listen_queue))
         return refuse(req, 409, "already listening for a question, or no sound is coming in from the microphones");
-    uint8_t head[WAV_HEADER];
-    wav_header(head, AUDIO_RATE, 1, rec.samples * 2);
-    httpd_resp_set_type(req, "audio/wav");
-    httpd_resp_send_chunk(req, (char *)head, WAV_HEADER);
-    for (size_t at = 0; at < rec.samples; at += SPEAK_CHUNK / 2) {
-        size_t n = rec.samples - at < SPEAK_CHUNK / 2 ? rec.samples - at : SPEAK_CHUNK / 2;
-        httpd_resp_send_chunk(req, (char *)(rec.pcm + at), n * 2);
-    }
-    httpd_resp_send_chunk(req, NULL, 0);
-    wake_record_done(&rec);
+    listen_job_t job = {.max_s = max_s, .vad = use_vad};
+    if (httpd_req_async_handler_begin(req, &job.req) != ESP_OK) return refuse(req, 500, "could not take the request");
+    xQueueSend(listen_queue, &job, 0);
     return ESP_OK;
 }
 
@@ -1056,6 +1162,55 @@ static esp_err_t on_snap(httpd_req_t *req)
 #define PICTURE_DEFAULT_S 60
 
 #define GLASS_STUCK "the glass did not answer in half a second (it restarts itself after 10)"
+#define JPEG_MAX (256 * 1024)          // one picture as JPEG: far more than a 320x240 face needs
+
+// ?format=jpeg: the body is one JPEG (its own size, w and h multiples of 16, up to
+// the screen's). It is read whole into PSRAM, then decoded straight into the
+// buffer the glass gives out, as the RGB565 big-endian a raw picture would be.
+// Answers false when it was refused (and says why); else *w, *h are its size.
+static struct { int recv_ms, wait_ms, decode_ms, internal_kb; } jpeg_took;   // the last JPEG's costs, said in its answer
+
+static bool jpeg_work(httpd_req_t *req, int kind, int *w, int *h)
+{
+    bool done = false;
+    int64_t t0 = esp_timer_get_time();
+    jpeg_dec_handle_t dec = NULL;
+    size_t len = req->content_len;
+    uint8_t *in = len && len <= JPEG_MAX ? heap_caps_malloc(len, MALLOC_CAP_SPIRAM) : NULL;
+    if (!in) { refuse(req, len > JPEG_MAX ? 413 : 400, len ? "the JPEG is too big or there is no memory" : "no JPEG"); return false; }
+    for (size_t have = 0; have < len;) {
+        int n = httpd_req_recv(req, (char *)in + have, len - have > 8192 ? 8192 : len - have);
+        if (n <= 0) { refuse(req, 400, "the JPEG did not arrive whole"); goto out; }
+        have += n;
+    }
+    int64_t t1 = esp_timer_get_time();
+    jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
+    cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_BE;
+    jpeg_dec_io_t io = {.inbuf = in, .inbuf_len = len};
+    jpeg_dec_header_info_t info;
+    int out_len = 0;
+    if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK || jpeg_dec_parse_header(dec, &io, &info) != JPEG_ERR_OK) {
+        refuse(req, 400, "that is not a JPEG this board reads"); goto out;
+    }
+    *w = info.width; *h = info.height;
+    if (*w > BOARD_W || *h > BOARD_H || *w % 16 || *h % 16 || jpeg_dec_get_outbuf_len(dec, &out_len) != JPEG_ERR_OK
+        || out_len != *w * *h * 2) {
+        refuse(req, 400, "a JPEG up to the screen's size, width and height multiples of 16"); goto out;
+    }
+    io.outbuf = ui_image_begin(kind, *w, *h);            // waits while the glass draws the last frame
+    if (!io.outbuf) { refuse(req, 503, "the glass is busy or out of memory"); goto out; }
+    int64_t t2 = esp_timer_get_time();
+    jpeg_took.internal_kb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;   // while the decoder is open
+    if (jpeg_dec_process(dec, &io) != JPEG_ERR_OK) { ui_image_abort(kind); refuse(req, 400, "the JPEG would not decode"); goto out; }
+    jpeg_took.recv_ms = (t1 - t0) / 1000;
+    jpeg_took.wait_ms = (t2 - t1) / 1000;
+    jpeg_took.decode_ms = (esp_timer_get_time() - t2) / 1000;
+    done = true;
+out:
+    if (dec) jpeg_dec_close(dec);
+    free(in);
+    return done;
+}
 
 static void image_work(httpd_req_t *req)
 {
@@ -1067,6 +1222,24 @@ static void image_work(httpd_req_t *req)
     int seconds = query_value(req, "seconds", text, sizeof text) ? atoi(text) : PICTURE_DEFAULT_S;
     char name[64] = {0};
     if (query_value(req, "name", text, sizeof text)) { unescape(text); strlcpy(name, text, sizeof name); }
+    if (query_value(req, "format", text, sizeof text) && !strcmp(text, "jpeg")) {
+        if (kind == UI_PICTURE && ui_face_hidden()) {           // tapped away: taken and dropped, not decoded
+            char sink[512];
+            for (size_t have = 0; have < req->content_len;) {
+                int n = httpd_req_recv(req, sink, req->content_len - have > sizeof sink ? sizeof sink : req->content_len - have);
+                if (n <= 0) break;
+                have += n;
+            }
+            cJSON *j = cJSON_CreateObject();
+            cJSON_AddBoolToObject(j, "ok", true);
+            cJSON_AddBoolToObject(j, "hidden", true);
+            say_json(req, 200, j);
+            goto done;
+        }
+        if (!jpeg_work(req, kind, &w, &h)) goto done;
+        if (kind == UI_PICTURE) goto frame;
+        goto show;
+    }
     if (w < 1 || h < 1 || w > BOARD_W || h > BOARD_H || req->content_len != (size_t)w * h * 2) {
         refuse(req, 400, "w and h up to the screen's, and exactly w*h*2 bytes of RGB565");
         goto done;
@@ -1079,11 +1252,28 @@ static void image_work(httpd_req_t *req)
         if (n <= 0) { ui_image_abort(kind); refuse(req, 400, "the image did not arrive whole"); goto done; }
         have += n;
     }
+    int64_t shown_at;
+show:
+    shown_at = esp_timer_get_time();
     if (!ui_image_show(kind, w, h, seconds, name)) { refuse(req, 503, GLASS_STUCK); goto done; }
+    goto shown;
+frame:
+    shown_at = esp_timer_get_time();
+    if (!ui_frame_show(w, h, seconds)) { refuse(req, 503, GLASS_STUCK); goto done; }
+shown:;
+    int show_ms = (esp_timer_get_time() - shown_at) / 1000;
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
     if (background) cJSON_AddStringToObject(j, "background", name);
     else cJSON_AddNumberToObject(j, "seconds", seconds);
+    if (query_value(req, "format", text, sizeof text) && !strcmp(text, "jpeg")) {
+        cJSON *took = cJSON_AddObjectToObject(j, "took_ms");      // where a frame's time goes
+        cJSON_AddNumberToObject(took, "recv", jpeg_took.recv_ms);
+        cJSON_AddNumberToObject(took, "wait", jpeg_took.wait_ms);
+        cJSON_AddNumberToObject(took, "decode", jpeg_took.decode_ms);
+        cJSON_AddNumberToObject(took, "show", show_ms);
+        cJSON_AddNumberToObject(j, "internal_kb_decoding", jpeg_took.internal_kb);
+    }
     say_json(req, 200, j);
 done:
     httpd_req_async_handler_complete(req);
@@ -1102,7 +1292,7 @@ static esp_err_t on_image(httpd_req_t *req)
     if (!let_in(req)) return ESP_OK;
     if (!ui_ok()) return refuse(req, 503, "this board has no screen up");
     char text[16];
-    if (!query_value(req, "w", text, sizeof text)) {               // no size: a clear, as JSON {"clear": true} or an empty body
+    if (!query_value(req, "w", text, sizeof text) && !query_value(req, "format", text, sizeof text)) {   // no size, no JPEG: a clear, as JSON {"clear": true} or an empty body
         if (req->content_len) { cJSON *in = read_json(req); if (!in) return ESP_OK; cJSON_Delete(in); }
         if (!ui_image_drop(!strncmp(req->uri, "/screen/background", 18) ? UI_SCENE : UI_PICTURE)) return refuse(req, 503, GLASS_STUCK);
         cJSON *j = cJSON_CreateObject();
@@ -1266,7 +1456,11 @@ void server_start(void)
     cfg.lru_purge_enable = true;
     if (httpd_start(&server, &cfg) != ESP_OK) { ESP_LOGE(TAG, "the server did not start"); return; }
     speak_queue = xQueueCreate(2, sizeof(httpd_req_t *));
+    play_queue = xQueueCreate(8, sizeof(sentence_t));
+    task_in_psram(play_task, "play", 6144, 5, 1);       // plays what speak took in, from PSRAM
     task_in_psram(speak_task, "speak", 8192, 5, 1);      // plays sound, writes no flash: +8 KB of internal RAM (0.4.0)
+    listen_queue = xQueueCreate(1, sizeof(listen_job_t));
+    task_in_psram(listen_task, "listen", 6144, 5, 1);    // a listen waits for her to finish, off the server task
     glass_queue = xQueueCreate(1, sizeof(httpd_req_t *));
     task_in_psram(glass_task, "glass", 8192, 4, 1);
     store_queue = xQueueCreate(1, sizeof(store_job_t));

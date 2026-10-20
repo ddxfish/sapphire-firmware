@@ -156,7 +156,12 @@ void audio_set_sink(audio_sink_fn fn) { sink = fn; }
 
 // --- the speaker -------------------------------------------------------------------
 
-bool audio_take_speaker(TickType_t wait) { return ok && xSemaphoreTake(speaker, wait) == pdTRUE; }
+bool audio_take_speaker(TickType_t wait)
+{
+    if (!ok || xSemaphoreTake(speaker, wait) != pdTRUE) return false;
+    board_speaker_check();                         // a chip that reset on a rail dip is put back before it is spoken into
+    return true;
+}
 void audio_give_speaker(void) { xSemaphoreGive(speaker); }
 
 void audio_play(const int16_t *pcm, size_t samples, int channels)

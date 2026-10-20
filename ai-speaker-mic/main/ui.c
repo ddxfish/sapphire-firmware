@@ -48,7 +48,8 @@ static bool screen_on = true, dimmed, asleep;   // dimmed and asleep come by the
 static char last_cue[16];
 static volatile int64_t beat_us;        // the tick's last run: main.c's watch restarts the board when it goes stale
 
-typedef struct { uint8_t *px; int w, h; lv_image_dsc_t dsc; bool filling; } image_t;
+// `old`: the picture still on the glass while the next one arrives (frames, not flashes)
+typedef struct { uint8_t *px, *old; int w, h; lv_image_dsc_t dsc; bool filling; } image_t;
 static image_t images[2];
 
 #define C_TEXT lv_color_hex(0xe8ecf1)
@@ -60,13 +61,13 @@ static image_t images[2];
 
 // --- the images ---------------------------------------------------------------------
 
-static void image_apply(int kind)
+static void image_apply(int kind, lv_color_format_t cf)
 {
     image_t *im = &images[kind];
     lv_obj_t *obj = kind == UI_SCENE ? scene : picture;
     im->dsc = (lv_image_dsc_t){0};             // no image cache is built (sdkconfig), so a reused descriptor is safe
     im->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    im->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    im->dsc.header.cf = cf;
     im->dsc.header.w = im->w;
     im->dsc.header.h = im->h;
     im->dsc.header.stride = im->w * 2;
@@ -84,15 +85,33 @@ static void image_free(int kind)
     lv_obj_t *obj = kind == UI_SCENE ? scene : picture;
     if (obj) { lv_image_set_src(obj, NULL); lv_obj_set_hidden(obj, true); }
     free(im->px);
-    im->px = NULL;
+    free(im->old);
+    im->px = im->old = NULL;
     im->filling = false;
 }
 
 static void on_picture_end(lv_timer_t *t)
 {
-    image_free(UI_PICTURE);
+    image_t *im = &images[UI_PICTURE];
+    if (im->filling) {                         // the next one is landing: only the one on the glass goes
+        lv_image_set_src(picture, NULL);
+        lv_obj_set_hidden(picture, true);
+        free(im->old);
+        im->old = NULL;
+    } else {
+        image_free(UI_PICTURE);
+    }
     lv_timer_delete(picture_timer);
     picture_timer = NULL;
+}
+
+static void picture_timer_arm(int seconds)
+{
+    if (picture_timer) lv_timer_delete(picture_timer);
+    if (seconds < 1) seconds = 60;
+    if (seconds > PICTURE_MAX_S) seconds = PICTURE_MAX_S;
+    picture_timer = lv_timer_create(on_picture_end, seconds * 1000, NULL);
+    lv_timer_set_repeat_count(picture_timer, 1);
 }
 
 static void picture_end(void)
@@ -111,11 +130,20 @@ static void wake_screen(void)
     lv_display_trigger_activity(disp);
 }
 
+// A face tapped away stays away for the rest of her reply: its next frame is
+// already on its way, and would bring it straight back (on_tick clears it).
+static bool face_hidden;
+
 // a tap while the glass is dark only brings it back; a tap during a picture ends the picture
 static bool tap_taken(void)
 {
     if (!screen_on || dimmed || asleep) { wake_screen(); return true; }
-    if (images[UI_PICTURE].px && !images[UI_PICTURE].filling) { picture_end(); return true; }
+    if (images[UI_PICTURE].px && !images[UI_PICTURE].filling) {
+        if (images[UI_PICTURE].dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED && (server_talking() || light_turn_on()))
+            face_hidden = true;                // a face's frames (ui_frame_show), while she talks
+        picture_end();
+        return true;
+    }
     return false;
 }
 
@@ -254,6 +282,7 @@ static void draw_status(void)
 static void on_tick(lv_timer_t *t)
 {
     beat_us = esp_timer_get_time();
+    if (face_hidden && !server_talking() && !light_turn_on()) face_hidden = false;   // her reply is over: the face may come back
     static uint32_t was = 0xffffffff;
     uint8_t r, g, b;
     light_current(&r, &g, &b);
@@ -637,10 +666,16 @@ uint8_t *ui_image_begin(int kind, int w, int h)
     // "filling" here was left behind: its show or its drop missed the glass's
     // door, and every image after it was refused until a restart.
     {
-        uint8_t *fresh = heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
+        uint8_t *fresh = heap_caps_aligned_alloc(64, (size_t)w * h * 2, MALLOC_CAP_SPIRAM);   // 64: a PSRAM cache line (the JPEG decoder wants 16)
         if (fresh) {
-            if (kind == UI_PICTURE && picture_timer) { lv_timer_delete(picture_timer); picture_timer = NULL; }
-            image_free(kind);                             // the old one goes only once the new one has memory
+            // the picture's timer runs on while this one lands (on_picture_end leaves a filling one
+            // alone): a show re-arms it, and a frame that never arrives cannot hold the glass for ever
+            if (kind == UI_PICTURE && im->px && !im->filling) {
+                free(im->old);                            // a picture on the glass stays up until this one is whole
+                im->old = im->px;
+            } else {
+                image_free(kind);                         // the old one goes only once the new one has memory
+            }
             im->px = px = fresh;
             im->w = w; im->h = h;
             im->filling = true;
@@ -659,15 +694,56 @@ bool ui_image_show(int kind, int w, int h, int seconds, const char *name)
         uint16_t *p = (uint16_t *)im->px;                // the wire is big-endian, LVGL's RGB565 is little
         for (size_t i = 0, n = (size_t)w * h; i < n; i++) p[i] = (uint16_t)(p[i] << 8 | p[i] >> 8);
         im->filling = false;
-        image_apply(kind);
+        image_apply(kind, LV_COLOR_FORMAT_RGB565);
+        free(im->old);                                   // the glass points at the new one now
+        im->old = NULL;
         if (kind == UI_SCENE) strlcpy(scene_name, name ? name : "", sizeof scene_name);
         else {
-            if (seconds < 1) seconds = 60;
-            if (seconds > PICTURE_MAX_S) seconds = PICTURE_MAX_S;
-            picture_timer = lv_timer_create(on_picture_end, seconds * 1000, NULL);
-            lv_timer_set_repeat_count(picture_timer, 1);
+            picture_timer_arm(seconds);
             if (screen_on) wake_screen();
         }
+        shown = true;
+    }
+    lvgl_port_unlock();
+    return shown;
+}
+
+#define FRAME_LINES 16                  // one panel write: the SPI bus takes BOARD_W x 16 lines at most
+
+// A frame of a moving picture (a face): left big-endian, as the panel takes it and
+// LVGL reads as RGB565_SWAPPED. After the first, a frame of the same size is painted
+// straight to the panel in strips and LVGL's picture is pointed at it without a
+// redraw, so a repaint for any other reason draws this same frame. LVGL's own path
+// (PSRAM draw buffers, a byte swap per strip) cost ~3 us a pixel: 180 ms at 240x240.
+bool ui_frame_show(int w, int h, int seconds)
+{
+    if (!ok || !take()) return false;
+    image_t *im = &images[UI_PICTURE];
+    bool shown = false;
+    if (im->px && im->filling && im->w == w && im->h == h) {
+        im->filling = false;
+        if (!lv_obj_has_flag(picture, LV_OBJ_FLAG_HIDDEN) && im->dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED
+            && im->dsc.header.w == w && im->dsc.header.h == h) {
+            im->dsc.data = im->px;
+            int x = (BOARD_W - w) / 2, y = (BOARD_H - h) / 2;
+            for (int r = 0; r < h; r += FRAME_LINES) {
+                int n = h - r < FRAME_LINES ? h - r : FRAME_LINES;
+                esp_lcd_panel_draw_bitmap(board_glass()->panel, x, y + r, x + w, y + r + n, im->px + (size_t)r * w * 2);
+            }
+            // the toast and the cards live on the top layer, which LVGL did not know was painted
+            // over: each one showing is drawn again (only its own area takes LVGL's slow path)
+            lv_obj_t *top = lv_layer_top();
+            for (uint32_t i = 0, n = lv_obj_get_child_count(top); i < n; i++) {
+                lv_obj_t *o = lv_obj_get_child(top, i);
+                if (!lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) lv_obj_invalidate(o);
+            }
+        } else {
+            image_apply(UI_PICTURE, LV_COLOR_FORMAT_RGB565_SWAPPED);
+        }
+        free(im->old);                                   // painted ~25 ms after it was queued; the next frame is later
+        im->old = NULL;
+        picture_timer_arm(seconds);
+        if (screen_on) wake_screen();
         shown = true;
     }
     lvgl_port_unlock();
@@ -681,7 +757,14 @@ static bool image_drop(int kind, bool mine)
 {
     if (!ok || kind < 0 || kind > 1 || !take()) return false;
     if (images[kind].filling && !mine) { lvgl_port_unlock(); return true; }
-    if (kind == UI_PICTURE) picture_end();
+    image_t *im = &images[kind];
+    if (mine && kind == UI_PICTURE && im->filling && im->old) {
+        free(im->px);                                    // one bad frame: the one before stays, its timer still running
+        im->px = im->old;
+        im->old = NULL;
+        im->filling = false;
+        if (!picture_timer) picture_timer_arm(0);
+    } else if (kind == UI_PICTURE) picture_end();
     else { image_free(UI_SCENE); scene_name[0] = 0; }
     lvgl_port_unlock();
     return true;
@@ -692,6 +775,7 @@ bool ui_image_abort(int kind) { return image_drop(kind, true); }
 
 const char *ui_scene_name(void) { return scene_name; }
 bool ui_picture_on(void) { return images[UI_PICTURE].px && !images[UI_PICTURE].filling; }
+bool ui_face_hidden(void) { return face_hidden; }
 
 bool ui_screen_power(bool on)
 {

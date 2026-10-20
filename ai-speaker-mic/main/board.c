@@ -25,10 +25,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "board";
 static i2c_master_bus_handle_t i2c;
 static esp_io_expander_handle_t expander;
+static SemaphoreHandle_t expander_lock;  // its driver read-modify-writes a cached copy: one writer at a time
+static i2c_master_dev_handle_t expander_raw;   // the chip read back: its driver only remembers what it wrote
+static const audio_codec_if_t *out_codec;
+static es8311_codec_cfg_t es8311;
 static i2s_chan_handle_t tx, rx;
 static board_audio_t audio;
 static board_glass_t glass;
@@ -45,6 +50,7 @@ static int key_errors;                 // failed reads of the three keys
 #define PIN_CAMERA_DOWN IO_EXPANDER_PIN_NUM_5
 #define PIN_CAMERA_SEL IO_EXPANDER_PIN_NUM_6
 #define PIN_SD_CS IO_EXPANDER_PIN_NUM_3          // the card's D3/CS (board.h)
+#define OUTPUTS (PIN_LCD_RESET | PIN_TOUCH_RESET | PIN_CAMERA_DOWN | PIN_CAMERA_SEL | PIN_PA | PIN_SD_CS)
 #define PIN_KEYS (IO_EXPANDER_PIN_NUM_9 | IO_EXPANDER_PIN_NUM_10 | IO_EXPANDER_PIN_NUM_11)   // Key1..Key3 (board.h)
 
 static bool expander_init(void)
@@ -55,8 +61,10 @@ static bool expander_init(void)
         expander = NULL;
         return false;
     }
-    uint32_t outputs = PIN_LCD_RESET | PIN_TOUCH_RESET | PIN_CAMERA_DOWN | PIN_CAMERA_SEL | PIN_PA | PIN_SD_CS;
-    if (esp_io_expander_set_dir(expander, outputs, IO_EXPANDER_OUTPUT) != ESP_OK) {
+    i2c_device_config_t raw = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = ESP_IO_EXPANDER_I2C_TCA9555_ADDRESS_000, .scl_speed_hz = 400000};
+    if (!expander_raw) i2c_master_bus_add_device(i2c, &raw, &expander_raw);
+    if (!expander_lock) expander_lock = xSemaphoreCreateMutex();
+    if (esp_io_expander_set_dir(expander, OUTPUTS, IO_EXPANDER_OUTPUT) != ESP_OK) {
         esp_io_expander_del(expander);
         expander = NULL;
         return false;
@@ -98,8 +106,17 @@ static bool i2s_init(int rate)
         && i2s_channel_enable(tx) == ESP_OK && i2s_channel_enable(rx) == ESP_OK;
 }
 
+// The ES8311's power, clock and routing registers as boot left them; volume (0x32) and mute (0x31) move, so they are not here.
+#define CODEC_REGS 8
+static const int codec_regs[CODEC_REGS] = {0x00, 0x01, 0x0D, 0x0E, 0x12, 0x14, 0x37, 0x44};
+static int codec_want[CODEC_REGS];
+static int speaker_heals;
+static char speaker_last[64] = "";
+static int codec_rate;
+
 static bool codecs_init(int rate)
 {
+    codec_rate = rate;
     audio_codec_i2s_cfg_t i2s_cfg = {.port = I2S_NUM_0, .rx_handle = rx, .tx_handle = tx};
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
@@ -109,7 +126,7 @@ static bool codecs_init(int rate)
     const audio_codec_ctrl_if_t *in_ctrl = audio_codec_new_i2c_ctrl(&i2c_cfg);
     if (!data_if || !gpio_if || !out_ctrl || !in_ctrl) return false;
 
-    es8311_codec_cfg_t es8311 = {
+    es8311 = (es8311_codec_cfg_t){
         .ctrl_if = out_ctrl, .gpio_if = gpio_if, .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
         .pa_pin = -1,                                 // the amplifier is on the expander
         .use_mclk = true, .hw_gain = {.pa_voltage = 5.0, .codec_dac_voltage = 3.3},
@@ -118,7 +135,7 @@ static bool codecs_init(int rate)
         .ctrl_if = in_ctrl,
         .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4,
     };
-    const audio_codec_if_t *out_codec = es8311_codec_new(&es8311);
+    out_codec = es8311_codec_new(&es8311);
     const audio_codec_if_t *in_codec = es7210_codec_new(&es7210);
     if (!out_codec || !in_codec) return false;
 
@@ -134,6 +151,7 @@ static bool codecs_init(int rate)
     if (esp_codec_dev_open(audio.out, &play) != 0 || esp_codec_dev_open(audio.in, &record) != 0) return false;
     esp_codec_dev_set_out_vol(audio.out, 70);
     esp_codec_dev_set_in_channel_gain(audio.in, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), settings.mic_gain_x2 / 2.0f);
+    for (int i = 0; i < CODEC_REGS; i++) out_codec->get_reg(out_codec, codec_regs[i], &codec_want[i]);
     return true;
 }
 
@@ -260,12 +278,18 @@ void board_i2c_counts(int *errors, int *resets, int *held) { *errors = touch_err
 bool board_sd_select(bool high)
 {
     if (!expander) return false;
-    return esp_io_expander_set_level(expander, PIN_SD_CS, high ? 1 : 0) == ESP_OK;
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    bool ok = esp_io_expander_set_level(expander, PIN_SD_CS, high ? 1 : 0) == ESP_OK;
+    xSemaphoreGive(expander_lock);
+    return ok;
 }
 
 void board_camera_power(bool on)
 {
-    if (expander) esp_io_expander_set_level(expander, PIN_CAMERA_DOWN, on ? 0 : 1);   // PWDN is active high
+    if (!expander) return;
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    esp_io_expander_set_level(expander, PIN_CAMERA_DOWN, on ? 0 : 1);   // PWDN is active high
+    xSemaphoreGive(expander_lock);
 }
 
 // One read of the expander's inputs, from the buttons' task. A failed read
@@ -289,8 +313,61 @@ int board_keys(void)
 
 void board_amplifier(bool on)
 {
-    if (expander) esp_io_expander_set_level(expander, PIN_PA, on);
+    if (!expander) return;
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    esp_io_expander_set_level(expander, PIN_PA, on);
+    xSemaphoreGive(expander_lock);
 }
+
+// Her voice reaches the air only while two chips still hold what boot told
+// them: the expander's amplifier pin as a driven output, and the ES8311's
+// power and clock registers. A dip on the rail can reset either one and not
+// this chip, and nothing else notices: I2S drains at real speed into a codec
+// that is not listening, and the expander's driver writes only what differs
+// from its cached copy, so no re-assert reaches the wire (2026-10-19: silent
+// until a restart). So whoever takes the speaker looks first, a few register
+// reads, and puts back what is gone. -1 not readable, 0 fine, 1 healed.
+int board_speaker_check(void)
+{
+    if (!expander || !expander_raw || !out_codec) return -1;
+    char why[64] = "";
+    uint8_t cfg[2], out[2];
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    bool read = i2c_master_transmit_receive(expander_raw, (uint8_t[]){0x06}, 1, cfg, 2, 50) == ESP_OK
+             && i2c_master_transmit_receive(expander_raw, (uint8_t[]){0x02}, 1, out, 2, 50) == ESP_OK;
+    if (read) {
+        uint32_t dir = cfg[0] | cfg[1] << 8, lvl = out[0] | out[1] << 8, want_lvl = 0, want_dir = 0;
+        expander->read_output_reg(expander, &want_lvl);           // the driver's copy
+        expander->read_direction_reg(expander, &want_dir);
+        if ((dir & OUTPUTS) || ((lvl ^ want_lvl) & OUTPUTS)) {
+            snprintf(why, sizeof why, "expander pins %04x/%04x", (unsigned)dir, (unsigned)lvl);
+            expander->write_output_reg(expander, want_lvl);
+            expander->write_direction_reg(expander, want_dir);
+        }
+    }
+    xSemaphoreGive(expander_lock);
+    if (!read) return -1;
+    for (int i = 0; i < CODEC_REGS; i++) {
+        int v = -1;
+        if (out_codec->get_reg(out_codec, codec_regs[i], &v) != 0) return -1;
+        if (v == codec_want[i]) continue;
+        size_t n = strlen(why);
+        snprintf(why + n, sizeof why - n, "%scodec %02x=%02x", n ? ", " : "", codec_regs[i], v);
+        esp_codec_dev_sample_info_t play = {.bits_per_sample = 16, .channel = 1, .sample_rate = codec_rate};
+        esp_codec_dev_close(audio.out);                           // the whole ES8311 setup again, as boot did it
+        out_codec->open(out_codec, &es8311, sizeof es8311);
+        esp_codec_dev_open(audio.out, &play);
+        esp_codec_dev_set_out_vol(audio.out, settings.volume);
+        break;
+    }
+    if (!why[0]) return 0;
+    speaker_heals++;
+    strlcpy(speaker_last, why, sizeof speaker_last);
+    ESP_LOGW(TAG, "the speaker had gone deaf (%s): put back (%d times so far)", why, speaker_heals);
+    return 1;
+}
+
+int board_speaker_heals(const char **last) { *last = speaker_last; return speaker_heals; }
 
 // Who answers on the shared bus: 0x18 ES8311, 0x20 TCA9555, 0x40 ES7210, and
 // with the plugs filled 0x15 (CST816 touch) and 0x3c (an OV camera's SCCB,
