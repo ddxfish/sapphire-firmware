@@ -177,6 +177,12 @@ static esp_err_t on_health(httpd_req_t *req)
         cJSON_AddNumberToObject(screen, "h", BOARD_H);
         cJSON_AddStringToObject(screen, "format", "rgb565be");
         cJSON_AddBoolToObject(screen, "jpeg", true);                      // /screen/picture?format=jpeg also takes one JPEG
+        cJSON_AddNumberToObject(screen, "fps", UI_STREAM_FPS);           // frames sent one after another are painted on this beat (0.7.8)
+        int painted, replaced;
+        ui_stream_counts(&painted, &replaced);
+        cJSON *stream = cJSON_AddObjectToObject(screen, "stream");        // since boot: frames painted, frames dropped for a newer one
+        cJSON_AddNumberToObject(stream, "painted", painted);
+        cJSON_AddNumberToObject(stream, "replaced", replaced);
         cJSON_AddBoolToObject(screen, "on", ui_screen_on());
         cJSON_AddStringToObject(screen, "chat", ui_chat_name());          // the chat name it shows; core sends it with POST /screen {"chat": ...}
         cJSON_AddStringToObject(screen, "brain", ui_brain_name());
@@ -230,6 +236,7 @@ static esp_err_t on_health(httpd_req_t *req)
         cJSON_AddNumberToObject(st, "count", card.count);
         cJSON_AddBoolToObject(st, "writing", card.writing);
         cJSON_AddBoolToObject(st, "failed", card.failed);
+        cJSON_AddStringToObject(st, "last_error", storage_last_error());   // what the card said the last time a write went wrong; "" after a good one
     }
     cJSON *plays = cJSON_AddObjectToObject(j, "plays");
     cJSON_AddStringToObject(plays, "type", "audio/wav");
@@ -992,16 +999,23 @@ static void store_put(httpd_req_t *req)
     }
     free(buf);
     if (!problem && !plain_ok && seen < sizeof head) problem = 422;
+    char why[160];                                             // a card's own words (errno) travel to Sapphire's log (0.7.8)
     if (problem) {
         storage_write_drop(w);
         if (problem == 422) refuse(req, 400, "not a sealed backup: plaintext never lands on this card");
-        else if (problem == 507) refuse(req, 507, "the card is full or failed while writing");
-        else refuse(req, 400, "the backup did not arrive whole");
+        else if (problem == 507) {
+            snprintf(why, sizeof why, "the card failed while writing (%s)", storage_last_error());
+            refuse(req, 507, why);
+        } else refuse(req, 400, "the backup did not arrive whole");
         goto awake;
     }
     char sha[65];
     uint64_t size = 0;
-    if (!storage_write_finish(w, sha, &size)) { refuse(req, 507, "the card could not keep the backup"); goto awake; }
+    if (!storage_write_finish(w, sha, &size)) {
+        snprintf(why, sizeof why, "the card could not keep the backup (%s)", storage_last_error());
+        refuse(req, 507, why);
+        goto awake;
+    }
     char want[72] = {0};
     if (httpd_req_get_hdr_value_str(req, "X-Sha256", want, sizeof want) == ESP_OK && want[0] && strcasecmp(want, sha)) {
         storage_remove(name);                                  // and the hash beside it
@@ -1162,7 +1176,7 @@ static esp_err_t on_snap(httpd_req_t *req)
 #define PICTURE_DEFAULT_S 60
 
 #define GLASS_STUCK "the glass did not answer in half a second (it restarts itself after 10)"
-#define JPEG_MAX (256 * 1024)          // one picture as JPEG: far more than a 320x240 face needs
+#define JPEG_MAX (256 * 1024)          // one picture as JPEG: the whole glass at any quality sits well under it
 
 // ?format=jpeg: the body is one JPEG (its own size, w and h multiples of 16, up to
 // the screen's). It is read whole into PSRAM, then decoded straight into the
@@ -1221,9 +1235,10 @@ static void image_work(httpd_req_t *req)
     int h = query_value(req, "h", text, sizeof text) ? atoi(text) : 0;
     int seconds = query_value(req, "seconds", text, sizeof text) ? atoi(text) : PICTURE_DEFAULT_S;
     char name[64] = {0};
+    bool replaced = false;                                      // a frame: it took the place of one still waiting for the beat
     if (query_value(req, "name", text, sizeof text)) { unescape(text); strlcpy(name, text, sizeof name); }
     if (query_value(req, "format", text, sizeof text) && !strcmp(text, "jpeg")) {
-        if (kind == UI_PICTURE && ui_face_hidden()) {           // tapped away: taken and dropped, not decoded
+        if (kind == UI_PICTURE && ui_stream_hidden()) {         // tapped away: taken and dropped, not decoded
             char sink[512];
             for (size_t have = 0; have < req->content_len;) {
                 int n = httpd_req_recv(req, sink, req->content_len - have > sizeof sink ? sizeof sink : req->content_len - have);
@@ -1259,7 +1274,7 @@ show:
     goto shown;
 frame:
     shown_at = esp_timer_get_time();
-    if (!ui_frame_show(w, h, seconds)) { refuse(req, 503, GLASS_STUCK); goto done; }
+    if (!ui_frame_ready(w, h, seconds, &replaced)) { refuse(req, 503, GLASS_STUCK); goto done; }   // painted on the beat (ui.c), answered now
 shown:;
     int show_ms = (esp_timer_get_time() - shown_at) / 1000;
     cJSON *j = cJSON_CreateObject();
@@ -1271,8 +1286,12 @@ shown:;
         cJSON_AddNumberToObject(took, "recv", jpeg_took.recv_ms);
         cJSON_AddNumberToObject(took, "wait", jpeg_took.wait_ms);
         cJSON_AddNumberToObject(took, "decode", jpeg_took.decode_ms);
-        cJSON_AddNumberToObject(took, "show", show_ms);
+        cJSON_AddNumberToObject(took, "show", show_ms);           // a frame: handed to the beat; a background: painted
         cJSON_AddNumberToObject(j, "internal_kb_decoding", jpeg_took.internal_kb);
+        if (kind == UI_PICTURE) {
+            cJSON_AddNumberToObject(j, "fps", UI_STREAM_FPS);     // the beat it is painted on: a sender paces to it
+            cJSON_AddBoolToObject(j, "replaced", replaced);       // true: the sender is ahead of the beat
+        }
     }
     say_json(req, 200, j);
 done:

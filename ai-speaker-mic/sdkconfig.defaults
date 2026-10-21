@@ -9,13 +9,22 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Size, not debug: smaller code frees ~12 KB of internal RAM (0.8.0, the boot
+# minimum went 7 -> 21 KB). NOT the flash-driver/functions-into-flash knobs:
+# those freed more IRAM but starved esp-sr's model mmap (the shared flash MMU
+# table ran to 44 free 64 KB pages, under the 48 the models need), aborting at
+# boot. These two only shrink code and let mid-size mallocs reach PSRAM.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # PSRAM
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# 1024 before (0.8.0): mid-size mallocs may now land in PSRAM. NOTE no inline
+# comment on the value line: the kconfig loader can't parse it and falls back to
+# the IDF default 16384, which floods internal RAM (cost a bad 0.8.0 flash once).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y

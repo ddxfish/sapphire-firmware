@@ -13,6 +13,8 @@
 // Her `show` is a line across the top for a while; her `picture` takes the
 // whole glass until a tap or its time, then the scene is back. Both images
 // arrive as RGB565 big-endian and live in PSRAM; LVGL paints them.
+// A stream (0.7.8): JPEG frames sent one after another are painted on a steady
+// beat, UI_STREAM_FPS a second, the newest decoded frame each beat.
 // Every function here may be called from any task: each takes LVGL's lock,
 // waits half a second for it at most, and says false when the glass did not answer.
 #pragma once
@@ -22,6 +24,7 @@
 
 #define UI_SCENE 0
 #define UI_PICTURE 1
+#define UI_STREAM_FPS 3                // the beat a stream of frames is painted on (said in /health as screen.fps)
 
 void ui_start(void);
 bool ui_ok(void);
@@ -40,12 +43,16 @@ void ui_status(const char *text);                 // the top line's right side; 
 // `seconds` or a tap. NULL when the glass is busy or out of memory.
 uint8_t *ui_image_begin(int kind, int w, int h);
 bool ui_image_show(int kind, int w, int h, int seconds, const char *name);
-bool ui_frame_show(int w, int h, int seconds);    // a picture left big-endian (a JPEG frame), painted straight to the panel
+// A frame of a stream (a JPEG decoded big-endian): queued for the beat, the newest
+// wins. The first frame of a stream is painted at once. `replaced` says whether a
+// frame already waiting was dropped for this one. The stream ends `seconds` after its last frame.
+bool ui_frame_ready(int w, int h, int seconds, bool *replaced);
 bool ui_image_drop(int kind);                     // begin without show, or clear
 bool ui_image_abort(int kind);                    // from the one filling it: its upload broke off (a picture keeps the one before)
 const char *ui_scene_name(void);                  // "" = none
 bool ui_picture_on(void);
-bool ui_face_hidden(void);                        // her face was tapped away: its frames are not shown until her reply ends
+bool ui_stream_hidden(void);                      // a stream was tapped away while she talks: its frames are not shown until her reply ends
+void ui_stream_counts(int *painted, int *replaced);   // since boot
 bool ui_screen_power(bool on);                    // backlight; a touch turns it back on
 bool ui_screen_on(void);
 void ui_test_card(void);                          // frame, TOP, color bars, a touch echo on the console

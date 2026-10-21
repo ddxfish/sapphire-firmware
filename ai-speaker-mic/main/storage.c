@@ -406,6 +406,17 @@ bool storage_busy(void)
     return false;
 }
 
+// The last thing that went wrong writing the card, in the card's words: said in
+// /health and in the 507 a backup is refused with, so the night's log on Sapphire's
+// side says WHY and not only that (0.7.8: a backup died 2 s in with no trace).
+static char last_error[96];
+const char *storage_last_error(void) { return last_error; }
+static void note_error(const char *what, int err)
+{
+    snprintf(last_error, sizeof last_error, "%s: %s", what, err ? strerror(err) : "short write");
+    ESP_LOGE(TAG, "%s", last_error);
+}
+
 storage_write_t *storage_write_begin(const char *name, uint64_t expect)
 {
     if (!mounted || !storage_name_ok(name)) return NULL;
@@ -417,7 +428,7 @@ storage_write_t *storage_write_begin(const char *name, uint64_t expect)
     snprintf(w->part, sizeof w->part, FOLDER "/%s.partial", name);
     w->f = w->buf ? fopen(w->part, "wb") : NULL;
     if (!w->f) {
-        ESP_LOGE(TAG, "could not open %s: %s", w->part, strerror(errno));
+        note_error("open", errno);
         free(w->buf);
         free(w);
         xSemaphoreGive(busy);
@@ -428,8 +439,20 @@ storage_write_t *storage_write_begin(const char *name, uint64_t expect)
     // The file's whole room on the card, taken now: the card's table is
     // written here and at the end, not all through the minutes of the write,
     // so a pulled plug has two short moments to hit it instead of all of them.
-    if (expect > 1 && (fseek(w->f, (long)(expect - 1), SEEK_SET) || fputc(0, w->f) == EOF || fflush(w->f) || fsync(fileno(w->f))))
-        ESP_LOGW(TAG, "could not take the room first (%s): written the plain way", strerror(errno));
+    // A seek that fails leaves the file in error inside FatFs (every write after
+    // it fails too), so the file is opened again, fresh, and written the plain way.
+    if (expect > 1 && (fseek(w->f, (long)(expect - 1), SEEK_SET) || fputc(0, w->f) == EOF || fflush(w->f) || fsync(fileno(w->f)))) {
+        note_error("taking the room first", errno);
+        fclose(w->f);
+        w->f = fopen(w->part, "wb");
+        if (!w->f) {
+            note_error("open again", errno);
+            free(w->buf);
+            free(w);
+            xSemaphoreGive(busy);
+            return NULL;
+        }
+    }
     rewind(w->f);
 #endif
     taskENTER_CRITICAL(&state_mux);
@@ -445,8 +468,10 @@ storage_write_t *storage_write_begin(const char *name, uint64_t expect)
 static bool flush(storage_write_t *w)
 {
     if (!w->have) return true;
+    errno = 0;
     size_t n = fwrite(w->buf, 1, w->have, w->f);
     bool ok = n == w->have;
+    if (!ok) note_error("write", errno);
     w->have = 0;
     return ok;
 }
@@ -487,7 +512,12 @@ static void close_free(storage_write_t *w, bool ok)
 
 bool storage_write_finish(storage_write_t *w, char sha_hex[65], uint64_t *size)
 {
-    bool ok = flush(w) && w->got == w->expect && !fflush(w->f) && !fsync(fileno(w->f));
+    bool flushed = flush(w);                              // a short write says so itself
+    errno = 0;
+    bool ok = flushed && w->got == w->expect && !fflush(w->f) && !fsync(fileno(w->f));
+    if (!ok && flushed && w->got != w->expect) snprintf(last_error, sizeof last_error, "short: %llu of %llu bytes arrived", (unsigned long long)w->got, (unsigned long long)w->expect);
+    else if (!ok && flushed) note_error("closing", errno);
+    else if (ok) last_error[0] = 0;
     unsigned char digest[32];
     mbedtls_sha256_finish(&w->sha, digest);
     for (int i = 0; i < 32; i++) sprintf(sha_hex + 2 * i, "%02x", digest[i]);
@@ -500,7 +530,7 @@ bool storage_write_finish(storage_write_t *w, char sha_hex[65], uint64_t *size)
         // what the card holds, read back: the hash above is only of what arrived
         char back[65];
         ok = hash_file(w->part, back, false) && !strcmp(back, sha_hex);
-        if (!ok) ESP_LOGE(TAG, "%s did not read back as it was written: dropped", w->name);
+        if (!ok) { snprintf(last_error, sizeof last_error, "read back: not what was written"); ESP_LOGE(TAG, "%s did not read back as it was written: dropped", w->name); }
         ok = ok && keep_hash(w->name, sha_hex);
     }
 #endif

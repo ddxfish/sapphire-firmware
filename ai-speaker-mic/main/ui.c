@@ -35,7 +35,7 @@ static const char *TAG = "ui";
 static lv_display_t *disp;
 static lv_indev_t *indev;
 static bool ok;
-static lv_obj_t *scene, *picture, *catcher, *chat_lbl, *clock_lbl, *heard, *toast, *halo, *glow, *state_lbl;
+static lv_obj_t *scene, *picture, *shade, *catcher, *chat_lbl, *clock_lbl, *heard, *toast, *halo, *glow, *state_lbl;
 static lv_obj_t *zone[4], *zone_btn[4], *zone_lbl[4];
 static lv_obj_t *status_card, *status_text_lbl;
 static lv_obj_t *dial_card, *dial_lbl;
@@ -51,6 +51,28 @@ static volatile int64_t beat_us;        // the tick's last run: main.c's watch r
 // `old`: the picture still on the glass while the next one arrives (frames, not flashes)
 typedef struct { uint8_t *px, *old; int w, h; lv_image_dsc_t dsc; bool filling; } image_t;
 static image_t images[2];
+
+// A stream (0.7.8): JPEG frames decode as they land (the glass task) and are painted
+// no closer together than the beat, UI_STREAM_FPS a second: a frame that comes when
+// the last paint is a beat or more behind is painted at once, one that comes sooner
+// waits for the beat (a one-shot timer), and one that lands while another still waits
+// replaces it. So a sender at the beat's pace or slower sees every frame painted as
+// it lands with nothing added, and a faster one is thinned to the beat, the newest
+// each time. (0.7.9 first cut ran a free-running timer: with the sender at the same
+// rate the two drifted out of phase and every frame waited a whole beat.) At most
+// one frame waits, in PSRAM.
+static uint8_t *next_px;               // the frame waiting for the beat, decoded, big-endian
+static int next_w, next_h;
+static lv_timer_t *frame_timer;        // one-shot: the paint the beat has put off
+static int64_t frame_painted_us;       // the last paint
+static int frames_painted, frames_replaced;
+
+static void stream_stop(void)
+{
+    free(next_px);
+    next_px = NULL;
+    if (frame_timer) { lv_timer_delete(frame_timer); frame_timer = NULL; }
+}
 
 #define C_TEXT lv_color_hex(0xe8ecf1)
 #define C_DIM lv_color_hex(0x8a93a0)
@@ -76,6 +98,10 @@ static void image_apply(int kind, lv_color_format_t cf)
     lv_image_set_src(obj, &im->dsc);
     lv_obj_set_size(obj, im->w, im->h);
     lv_obj_center(obj);
+    if (kind == UI_PICTURE) {
+        lv_obj_set_style_bg_color(shade, trim >= 0 ? lv_color_mix(lv_color_hex(trim), lv_color_black(), 40) : lv_color_black(), 0);
+        lv_obj_set_hidden(shade, false);
+    }
     lv_obj_set_hidden(obj, false);
 }
 
@@ -84,6 +110,7 @@ static void image_free(int kind)
     image_t *im = &images[kind];
     lv_obj_t *obj = kind == UI_SCENE ? scene : picture;
     if (obj) { lv_image_set_src(obj, NULL); lv_obj_set_hidden(obj, true); }
+    if (kind == UI_PICTURE && shade) lv_obj_set_hidden(shade, true);
     free(im->px);
     free(im->old);
     im->px = im->old = NULL;
@@ -93,9 +120,11 @@ static void image_free(int kind)
 static void on_picture_end(lv_timer_t *t)
 {
     image_t *im = &images[UI_PICTURE];
+    stream_stop();                             // no frame for `seconds`: a stream is over
     if (im->filling) {                         // the next one is landing: only the one on the glass goes
         lv_image_set_src(picture, NULL);
         lv_obj_set_hidden(picture, true);
+        lv_obj_set_hidden(shade, true);
         free(im->old);
         im->old = NULL;
     } else {
@@ -117,6 +146,7 @@ static void picture_timer_arm(int seconds)
 static void picture_end(void)
 {
     if (picture_timer) { lv_timer_delete(picture_timer); picture_timer = NULL; }
+    stream_stop();
     image_free(UI_PICTURE);
 }
 
@@ -130,17 +160,22 @@ static void wake_screen(void)
     lv_display_trigger_activity(disp);
 }
 
-// A face tapped away stays away for the rest of her reply: its next frame is
-// already on its way, and would bring it straight back (on_tick clears it).
-static bool face_hidden;
+// A stream tapped away stays away: its next frame is already on its way, and would
+// bring it straight back. The board's own page is back for STREAM_HIDE_S, and while
+// she is still talking (on_tick clears it): the one way to use the corners under a cast.
+#define STREAM_HIDE_S 10
+static bool stream_hidden;
+static int64_t stream_hide_until_us;
 
 // a tap while the glass is dark only brings it back; a tap during a picture ends the picture
 static bool tap_taken(void)
 {
     if (!screen_on || dimmed || asleep) { wake_screen(); return true; }
     if (images[UI_PICTURE].px && !images[UI_PICTURE].filling) {
-        if (images[UI_PICTURE].dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED && (server_talking() || light_turn_on()))
-            face_hidden = true;                // a face's frames (ui_frame_show), while she talks
+        if (images[UI_PICTURE].dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED) {   // a stream's frames (ui_frame_ready)
+            stream_hidden = true;
+            stream_hide_until_us = esp_timer_get_time() + STREAM_HIDE_S * 1000000LL;
+        }
         picture_end();
         return true;
     }
@@ -282,7 +317,8 @@ static void draw_status(void)
 static void on_tick(lv_timer_t *t)
 {
     beat_us = esp_timer_get_time();
-    if (face_hidden && !server_talking() && !light_turn_on()) face_hidden = false;   // her reply is over: the face may come back
+    if (stream_hidden && esp_timer_get_time() > stream_hide_until_us && !server_talking() && !light_turn_on())
+        stream_hidden = false;                 // the while is over and so is her reply: a stream may come back
     static uint32_t was = 0xffffffff;
     uint8_t r, g, b;
     light_current(&r, &g, &b);
@@ -512,7 +548,17 @@ static void build(void)
         lv_obj_set_clickable(zone_lbl[i], false);
     }
 
-    // her picture, over everything but the toast
+    // her picture, over everything but the toast. Under it the shade: the whole glass
+    // dark (the chat's trim, nearly black) while a picture or a stream is up, so what
+    // the image does not cover is not the scene and the buttons showing through (0.7.9)
+    shade = lv_obj_create(scr);
+    lv_obj_remove_style_all(shade);
+    lv_obj_set_size(shade, BOARD_W, BOARD_H);
+    lv_obj_set_style_bg_opa(shade, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(shade, lv_color_black(), 0);
+    lv_obj_set_hidden(shade, true);
+    lv_obj_set_clickable(shade, true);
+    lv_obj_add_event_cb(shade, on_catcher, LV_EVENT_CLICKED, NULL);   // a tap beside the image is a tap on it
     picture = lv_image_create(scr);
     lv_obj_set_hidden(picture, true);
     lv_obj_set_clickable(picture, true);
@@ -709,46 +755,95 @@ bool ui_image_show(int kind, int w, int h, int seconds, const char *name)
 }
 
 #define FRAME_LINES 16                  // one panel write: the SPI bus takes BOARD_W x 16 lines at most
+#define FRAME_GAP_US (1000000LL / UI_STREAM_FPS)
 
-// A frame of a moving picture (a face): left big-endian, as the panel takes it and
-// LVGL reads as RGB565_SWAPPED. After the first, a frame of the same size is painted
-// straight to the panel in strips and LVGL's picture is pointed at it without a
-// redraw, so a repaint for any other reason draws this same frame. LVGL's own path
-// (PSRAM draw buffers, a byte swap per strip) cost ~3 us a pixel: 180 ms at 240x240.
-bool ui_frame_show(int w, int h, int seconds)
+// Paints the frame waiting for the beat. Under LVGL's lock: the beat is LVGL's own
+// timer, and the first frame of a stream comes through ui_frame_ready, which holds it.
+// A frame is left big-endian, as the panel takes it and LVGL reads as RGB565_SWAPPED.
+// After the first, a frame of the same size is painted straight to the panel in
+// strips and LVGL's picture is pointed at it without a redraw, so a repaint for any
+// other reason draws this same frame. LVGL's own path (PSRAM draw buffers, a byte
+// swap per strip) cost ~3 us a pixel: 180 ms at 240x240.
+static bool paint_next(void)
 {
+    image_t *im = &images[UI_PICTURE];
+    if (!next_px || im->filling) return false;           // one is landing now: its ready() paints the newest
+    uint8_t *frame = next_px;
+    int w = next_w, h = next_h;
+    next_px = NULL;
+    if (!lv_obj_has_flag(picture, LV_OBJ_FLAG_HIDDEN) && im->px && im->dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED
+        && im->dsc.header.w == w && im->dsc.header.h == h) {
+        im->dsc.data = frame;                            // LVGL draws this frame from now on; the panel gets it in strips
+        free(im->px);
+        im->px = frame;
+        int x = (BOARD_W - w) / 2, y = (BOARD_H - h) / 2;
+        for (int r = 0; r < h; r += FRAME_LINES) {
+            int n = h - r < FRAME_LINES ? h - r : FRAME_LINES;
+            esp_lcd_panel_draw_bitmap(board_glass()->panel, x, y + r, x + w, y + r + n, frame + (size_t)r * w * 2);
+        }
+        // the toast and the cards live on the top layer, which LVGL did not know was painted
+        // over: each one showing is drawn again (only its own area takes LVGL's slow path)
+        lv_obj_t *top = lv_layer_top();
+        for (uint32_t i = 0, n = lv_obj_get_child_count(top); i < n; i++) {
+            lv_obj_t *o = lv_obj_get_child(top, i);
+            if (!lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) lv_obj_invalidate(o);
+        }
+    } else {
+        free(im->px);
+        im->px = frame;
+        im->w = w; im->h = h;
+        image_apply(UI_PICTURE, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    }
+    frames_painted++;
+    frame_painted_us = esp_timer_get_time();
+    if (screen_on) wake_screen();
+    return true;
+}
+
+static void on_frame_tick(lv_timer_t *t);
+
+// The paint the beat puts off, `ms` from now; LVGL deletes the one-shot after it runs.
+static void paint_later(uint32_t ms)
+{
+    if (frame_timer) return;
+    frame_timer = lv_timer_create(on_frame_tick, ms ? ms : 1, NULL);
+    lv_timer_set_repeat_count(frame_timer, 1);
+}
+
+static void on_frame_tick(lv_timer_t *t)
+{
+    frame_timer = NULL;
+    if (!paint_next() && next_px) paint_later(20);       // a frame was landing: soon
+}
+
+// A decoded frame: the glass keeps what it shows until this one is painted, now if
+// the last paint is a beat or more behind, else when the beat comes. A frame already
+// waiting is dropped for it (the newest wins).
+bool ui_frame_ready(int w, int h, int seconds, bool *replaced)
+{
+    if (replaced) *replaced = false;
     if (!ok || !take()) return false;
     image_t *im = &images[UI_PICTURE];
-    bool shown = false;
+    bool taken = false;
     if (im->px && im->filling && im->w == w && im->h == h) {
         im->filling = false;
-        if (!lv_obj_has_flag(picture, LV_OBJ_FLAG_HIDDEN) && im->dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED
-            && im->dsc.header.w == w && im->dsc.header.h == h) {
-            im->dsc.data = im->px;
-            int x = (BOARD_W - w) / 2, y = (BOARD_H - h) / 2;
-            for (int r = 0; r < h; r += FRAME_LINES) {
-                int n = h - r < FRAME_LINES ? h - r : FRAME_LINES;
-                esp_lcd_panel_draw_bitmap(board_glass()->panel, x, y + r, x + w, y + r + n, im->px + (size_t)r * w * 2);
-            }
-            // the toast and the cards live on the top layer, which LVGL did not know was painted
-            // over: each one showing is drawn again (only its own area takes LVGL's slow path)
-            lv_obj_t *top = lv_layer_top();
-            for (uint32_t i = 0, n = lv_obj_get_child_count(top); i < n; i++) {
-                lv_obj_t *o = lv_obj_get_child(top, i);
-                if (!lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) lv_obj_invalidate(o);
-            }
-        } else {
-            image_apply(UI_PICTURE, LV_COLOR_FORMAT_RGB565_SWAPPED);
-        }
-        free(im->old);                                   // painted ~25 ms after it was queued; the next frame is later
+        if (next_px) { free(next_px); frames_replaced++; if (replaced) *replaced = true; }
+        next_px = im->px;
+        next_w = w; next_h = h;
+        im->px = im->old;                                // the glass keeps what it shows until the beat
         im->old = NULL;
-        picture_timer_arm(seconds);
-        if (screen_on) wake_screen();
-        shown = true;
+        if (im->px) { im->w = im->dsc.header.w; im->h = im->dsc.header.h; }
+        picture_timer_arm(seconds);                      // the stream ends this long after its last frame
+        int64_t since = esp_timer_get_time() - frame_painted_us;
+        if (since >= FRAME_GAP_US) paint_next();
+        else paint_later((uint32_t)((FRAME_GAP_US - since) / 1000) + 1);
+        taken = true;
     }
     lvgl_port_unlock();
-    return shown;
+    return taken;
 }
+
+void ui_stream_counts(int *painted, int *replaced) { *painted = frames_painted; *replaced = frames_replaced; }
 
 // `mine`: the caller is the one filling it (its upload broke off). Anyone else
 // asking for a clear while one is arriving is answered and nothing is freed:
@@ -762,6 +857,7 @@ static bool image_drop(int kind, bool mine)
         free(im->px);                                    // one bad frame: the one before stays, its timer still running
         im->px = im->old;
         im->old = NULL;
+        im->w = im->dsc.header.w; im->h = im->dsc.header.h;
         im->filling = false;
         if (!picture_timer) picture_timer_arm(0);
     } else if (kind == UI_PICTURE) picture_end();
@@ -775,7 +871,7 @@ bool ui_image_abort(int kind) { return image_drop(kind, true); }
 
 const char *ui_scene_name(void) { return scene_name; }
 bool ui_picture_on(void) { return images[UI_PICTURE].px && !images[UI_PICTURE].filling; }
-bool ui_face_hidden(void) { return face_hidden; }
+bool ui_stream_hidden(void) { return stream_hidden; }
 
 bool ui_screen_power(bool on)
 {

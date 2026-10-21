@@ -31,6 +31,7 @@ storage_write_t *storage_write_begin(const char *name, uint64_t expect);
 bool storage_write_feed(storage_write_t *w, const uint8_t *data, size_t n);
 bool storage_write_finish(storage_write_t *w, char sha_hex[65], uint64_t *size);
 void storage_write_drop(storage_write_t *w);
+const char *storage_last_error(void);          // the card's words on the last write that went wrong; "" after a good one (0.7.8)
 
 bool storage_format(void);                    // wipe + FAT32; refuses while busy
 bool storage_busy(void);                      // a write or a format is on

@@ -78,7 +78,7 @@ bool board_sd_select(bool high);       // D3/CS through the expander; false when
 #define BOARD_LCD_BL 5
 #define BOARD_LCD_DC 7
 #define BOARD_LCD_MOSI 9
-#define BOARD_LCD_HZ (40 * 1000 * 1000)
+#define BOARD_LCD_HZ (40 * 1000 * 1000)     // NOT 80: the DMA reads PSRAM, and at 80 MHz it outran the PSRAM (data lost, "io tx param failed"), then esp_lcd's in-flight count leaked and the next paint waited for ever (0.7.9, 2026-10-21)
 #define BOARD_PANEL_W 240              // the panel's own axes
 #define BOARD_PANEL_H 320
 #define BOARD_W 320                    // the glass as it is used: landscape, the plug on a side (2026-10-07)
