@@ -1,0 +1,7 @@
+## Managed components from Espressif's registry. mDNS only for P1 (net.c
+## advertises <name>.local); the audio codec, LCD and keyboard components come
+## with the later phases.
+dependencies:
+  idf: ">=5.5.3"
+  espressif/mdns: "^1.4.0"
+  espressif/esp_codec_dev: "~1.6.2"   # ES8311 codec driver (mic + speaker)

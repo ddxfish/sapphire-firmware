@@ -1,0 +1,29 @@
+# Sapphire satellite, M5Stack Cardputer ADV (Stamp-S3A = ESP32-S3FN8: 8 MB flash, NO PSRAM).
+# Internal RAM only (~379 KB free at boot, measured by the heap probe 2026-10-21).
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# smaller code frees more of the scarce internal RAM
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# the USB line is the console (native USB-serial-JTAG on the S3)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# TLS: Sapphire's certificate is pinned when the settings hold it; without one
+# the connection is not checked (a home network, and the setup says so)
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
+# internal RAM is the scarce thing: keep WiFi's buffers modest
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+CONFIG_FREERTOS_HZ=1000
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+# the web server's sockets must leave room for the board's own calls to Sapphire
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_CJSON_NESTING_LIMIT=16
