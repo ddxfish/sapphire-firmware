@@ -1,14 +1,20 @@
-// ui.h - the glass: a window into her chat, with five places to touch.
+// ui.h - the glass: a window into her chat, with seven places to touch.
 //
-//   ┌───────────────────────┐
-//   │[ring]   name 21:50 [scr]│  corners: the ring, the screen's power
-//   │                       │
-//   │       (the scene)     │  the background is the scene of the chat this board
-//   │         ( o )         │  talks in, pushed by Sapphire; the halo in the middle
-//   │                       │  is the ring's color. A tap there: listen now, or
-//   │   heard: what time..  │  stop her while she speaks.
-//   │[wake]           [voice]│  corners: the wake word on/off, the speaker on/off
-//   └───────────────────────┘
+//   ┌──────┬──────────────┬──────┐
+//   │[ring]│  21:50 (top) │ [scr]│  corners: the ring, the screen's power
+//   │      ├──────────────┤      │
+//   │      │ (the scene)  │      │  the background is the scene of the chat this board
+//   │      │    ( o )     │      │  talks in, pushed by Sapphire; the halo in the middle
+//   │      │   (middle)   │      │  is the ring's color. A tap there: listen now, or
+//   │      ├──────────────┤      │  stop her while she speaks. The top: the status page.
+//   │[wake]│ name (bottom)│[voice]│  corners: the wake word on/off, the speaker on/off
+//   └──────┴──────────────┴──────┘
+//
+// The seven places tile the glass (0.9.0): every tap lands in one, and each is a
+// button by name (main.c BUTTONS), so Sapphire may set what any of them does.
+// A stream whose sender asks for the taps (?taps=1) gets each tap's place by name
+// (link_tap) and no tap dismisses it; held anywhere, it is left (the next frame is
+// answered hidden). The table is said in /health as screen.zones.
 //
 // Her `show` is a line across the top for a while; her `picture` takes the
 // whole glass until a tap or its time, then the scene is back. Both images
@@ -25,6 +31,7 @@
 #define UI_SCENE 0
 #define UI_PICTURE 1
 #define UI_STREAM_FPS 3                // the beat a stream of frames is painted on (said in /health as screen.fps)
+typedef struct { const char *name; int x, y, w, h; } ui_zone_t;   // a place to touch, in glass pixels
 
 void ui_start(void);
 bool ui_ok(void);
@@ -46,12 +53,18 @@ bool ui_image_show(int kind, int w, int h, int seconds, const char *name);
 // A frame of a stream (a JPEG decoded big-endian): queued for the beat, the newest
 // wins. The first frame of a stream is painted at once. `replaced` says whether a
 // frame already waiting was dropped for this one. The stream ends `seconds` after its last frame.
-bool ui_frame_ready(int w, int h, int seconds, bool *replaced);
+// `taps`: the sender wants the taps (each one's place by name, link_tap) and no tap ends the stream.
+bool ui_frame_ready(int w, int h, int seconds, bool taps, bool *replaced);
 bool ui_image_drop(int kind);                     // begin without show, or clear
 bool ui_image_abort(int kind);                    // from the one filling it: its upload broke off (a picture keeps the one before)
 const char *ui_scene_name(void);                  // "" = none
 bool ui_picture_on(void);
 bool ui_stream_hidden(void);                      // a stream was tapped away while she talks: its frames are not shown until her reply ends
+bool ui_stream_left(void);                        // a tapping stream was held and left: true once, for the frame that is answered hidden
+bool ui_stream_taps(void);                        // a stream that owns the taps is up
+int ui_zones(const ui_zone_t **zones);            // the seven places, for /health screen.zones
+bool ui_status_open(void);                        // the status page (a button job: "status")
+bool ui_chats_open(const char *joined, const char *current);   // the chat picker (0.9.1): her list one name a line, drops up from the chat's name; the pick goes by link_pick_chat
 void ui_stream_counts(int *painted, int *replaced);   // since boot
 bool ui_screen_power(bool on);                    // backlight; a touch turns it back on
 bool ui_screen_on(void);

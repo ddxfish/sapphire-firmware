@@ -12,7 +12,7 @@
 #include "link.h"
 
 static const char *TAG = "buttons";
-#define BUTTONS_MAX 8
+#define BUTTONS_MAX 12                 // BOOT, three keys, the glass's seven places
 #define JOB_NAME BUTTON_JOB
 #define SAMPLE_MS 5                    // the pins are read this often, by a timer of their own
 #define SETTLE_MS 15                   // a level counts once it has held this long

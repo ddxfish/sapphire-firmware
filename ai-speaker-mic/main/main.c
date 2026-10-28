@@ -100,6 +100,8 @@ static void volume_by(int step)
 }
 static void job_louder(void) { volume_by(settings.vol_step); }
 static void job_quieter(void) { volume_by(-settings.vol_step); }
+static void job_status(void) { ui_status_open(); }             // the glass's status page (the top place, left alone)
+static void job_chats(void) { link_ask_chats(); }              // the chat picker (the bottom place, left alone): her list, then the pick
 
 static const button_job_t JOBS[] = {
     {"listen", "Listen now, or stop her while she speaks", job_listen},
@@ -111,8 +113,12 @@ static const button_job_t JOBS[] = {
     {"mute", "Speaker on or off", job_mute},
     {"louder", "Volume up a step", job_louder},
     {"quieter", "Volume down a step", job_quieter},
+    {"status", "This board's status page", job_status},
+    {"chats", "Pick the chat this board talks in", job_chats},
 };
-// BOOT, the three keys on the expander, then the glass's four corners (ui.c taps them by name).
+// BOOT, the three keys on the expander, then the glass's seven places (ui.c taps them by name): the
+// four corners, the top (the clock: the status page), the bottom (the chat's name: the chat picker), the middle
+// (the halo: listen, or stop her while she speaks).
 // Left alone, the real buttons are a remote for a board with no glass: volume at the two ends
 // (BOOT down, Key3 up), Key1 listens or stops her, Key2 is the ring, held the wake word, twice
 // the speaker (Krem's own set after a day of use, 2026-10-11).
@@ -126,6 +132,9 @@ static const button_def_t BUTTONS[] = {
     {"top-right", BUTTON_TAP, {"screen", NULL, NULL}},
     {"bottom-left", BUTTON_TAP, {"wake", NULL, NULL}},
     {"bottom-right", BUTTON_TAP, {"mute", NULL, NULL}},
+    {"top", BUTTON_TAP, {"status", NULL, NULL}},
+    {"bottom", BUTTON_TAP, {"chats", NULL, NULL}},
+    {"middle", BUTTON_TAP, {"listen", NULL, NULL}},
 };
 
 static void buttons_task(void *arg)
@@ -162,7 +171,7 @@ void app_main(void)
     room("after glass and camera");
     // before WiFi: what Sapphire set the presses to arrives the moment her stream opens, and
     // with no buttons known yet it was dropped (certain on a first start, the model store's format takes 20 s)
-    buttons_setup(BUTTONS, ui_ok() ? 8 : FIRST_KEY + BOARD_KEYS, JOBS, sizeof JOBS / sizeof JOBS[0]);   // no glass, no corners
+    buttons_setup(BUTTONS, ui_ok() ? sizeof BUTTONS / sizeof BUTTONS[0] : FIRST_KEY + BOARD_KEYS, JOBS, sizeof JOBS / sizeof JOBS[0]);   // no glass, no places
     if (settings_ready()) net_start(on_network_up);
     room("after WiFi");
     audio_start();

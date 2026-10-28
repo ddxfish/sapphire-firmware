@@ -172,12 +172,25 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddStringToObject(sound, "heal_last", deaf);
     if (ui_ok()) {
         cJSON_AddItemToArray(has, cJSON_CreateString("screen"));
+        cJSON_AddItemToArray(has, cJSON_CreateString("picker"));   // the chat picker on the bottom place (0.9.1): the Devices page offers Browse chats
         cJSON *screen = cJSON_AddObjectToObject(j, "screen");    // what /screen/picture and /screen/background take
         cJSON_AddNumberToObject(screen, "w", BOARD_W);
         cJSON_AddNumberToObject(screen, "h", BOARD_H);
         cJSON_AddStringToObject(screen, "format", "rgb565be");
         cJSON_AddBoolToObject(screen, "jpeg", true);                      // /screen/picture?format=jpeg also takes one JPEG
         cJSON_AddNumberToObject(screen, "fps", UI_STREAM_FPS);           // frames sent one after another are painted on this beat (0.7.8)
+        cJSON_AddBoolToObject(screen, "taps", true);                      // a stream may ask for the taps: ?taps=1 on its frames (0.9.0)
+        const ui_zone_t *zones;                                           // the places a tap is named by, tiling the glass
+        cJSON *places = cJSON_AddArrayToObject(screen, "zones");
+        for (int n = ui_zones(&zones), i = 0; i < n; i++) {
+            cJSON *z = cJSON_CreateObject();
+            cJSON_AddStringToObject(z, "name", zones[i].name);
+            cJSON_AddNumberToObject(z, "x", zones[i].x);
+            cJSON_AddNumberToObject(z, "y", zones[i].y);
+            cJSON_AddNumberToObject(z, "w", zones[i].w);
+            cJSON_AddNumberToObject(z, "h", zones[i].h);
+            cJSON_AddItemToArray(places, z);
+        }
         int painted, replaced;
         ui_stream_counts(&painted, &replaced);
         cJSON *stream = cJSON_AddObjectToObject(screen, "stream");        // since boot: frames painted, frames dropped for a newer one
@@ -1226,6 +1239,14 @@ out:
     return done;
 }
 
+static void say_hidden(httpd_req_t *req)                 // a frame taken and dropped: tapped away, or a game left by a long press
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "ok", true);
+    cJSON_AddBoolToObject(j, "hidden", true);
+    say_json(req, 200, j);
+}
+
 static void image_work(httpd_req_t *req)
 {
     bool background = !strcmp(req->uri, "/screen/background") || !strncmp(req->uri, "/screen/background?", 19);
@@ -1236,19 +1257,18 @@ static void image_work(httpd_req_t *req)
     int seconds = query_value(req, "seconds", text, sizeof text) ? atoi(text) : PICTURE_DEFAULT_S;
     char name[64] = {0};
     bool replaced = false;                                      // a frame: it took the place of one still waiting for the beat
+    bool taps = query_value(req, "taps", text, sizeof text) && (text[0] == '1' || text[0] == 't');   // the sender wants the taps (0.9.0)
     if (query_value(req, "name", text, sizeof text)) { unescape(text); strlcpy(name, text, sizeof name); }
     if (query_value(req, "format", text, sizeof text) && !strcmp(text, "jpeg")) {
-        if (kind == UI_PICTURE && ui_stream_hidden()) {         // tapped away: taken and dropped, not decoded
+        bool left = kind == UI_PICTURE && taps && ui_stream_left();   // asked every time, so a hold's "left" is consumed by this game's next frame and never waits for the next game's (0.9.3)
+        if (kind == UI_PICTURE && (ui_stream_hidden() || left)) {   // tapped away, or a game left by a long press (its own frames only): taken and dropped, not decoded
             char sink[512];
             for (size_t have = 0; have < req->content_len;) {
                 int n = httpd_req_recv(req, sink, req->content_len - have > sizeof sink ? sizeof sink : req->content_len - have);
                 if (n <= 0) break;
                 have += n;
             }
-            cJSON *j = cJSON_CreateObject();
-            cJSON_AddBoolToObject(j, "ok", true);
-            cJSON_AddBoolToObject(j, "hidden", true);
-            say_json(req, 200, j);
+            say_hidden(req);
             goto done;
         }
         if (!jpeg_work(req, kind, &w, &h)) goto done;
@@ -1274,7 +1294,10 @@ show:
     goto shown;
 frame:
     shown_at = esp_timer_get_time();
-    if (!ui_frame_ready(w, h, seconds, &replaced)) { refuse(req, 503, GLASS_STUCK); goto done; }   // painted on the beat (ui.c), answered now
+    if (!ui_frame_ready(w, h, seconds, taps, &replaced)) {                                            // painted on the beat (ui.c), answered now
+        if (ui_stream_hidden()) { say_hidden(req); goto done; }                                       // tapped away, or left by a hold, while this one decoded: dropped
+        refuse(req, 503, GLASS_STUCK); goto done;
+    }
 shown:;
     int show_ms = (esp_timer_get_time() - shown_at) / 1000;
     cJSON *j = cJSON_CreateObject();

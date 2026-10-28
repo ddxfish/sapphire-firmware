@@ -38,7 +38,7 @@ static int last_refusal;               // the events door's last status, said on
 #define PRESS_WAIT_MS 15000            // answered once a turn has started
 #define ROOM_WAIT_MS 20000             // a piece of the room is a megabyte: seconds over WiFi, never a minute
 
-typedef struct { char button[16], how[8], job[16]; } press_t;   // job set: not a press, work asked of Sapphire (link_ask)
+typedef struct { char kind, button[16], how[8], job[16], pick[64]; bool quiet; } press_t;   // kind 'c': her chat list, 'C': the chat picked (`pick`); else job set: work asked of Sapphire (link_ask), else a press; quiet: a tap on a game, no cue
 static QueueHandle_t presses;
 
 static void url_for(const char *door, char *out, size_t size)
@@ -225,7 +225,7 @@ static void send_press(const press_t *p)
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
     if (!ok) light_cue("error");
-    else if (!taken) light_cue("idle");          // nothing is set for it on her side: no turn, no cue will come
+    else if (!taken && !p->quiet) light_cue("idle");   // nothing is set for it on her side: no turn, no cue will come
 }
 
 // --- work that is Sapphire's: POST .../ask {"job": "stop" | "backup"} -------------------
@@ -262,12 +262,100 @@ static void send_ask(const char *job)
     if (!ok || strcmp(job, "stop")) ui_toast(why, ok ? 6 : 10);
 }
 
+// --- the chat picker (ui.c, the bottom place): GET .../chats, then POST .../chat {"name"} --------
+// Her list is the chats this board may talk in, newest first, with the one it talks in (Browse
+// chats off for it in Settings > Devices: that one alone). The pick is kept on her side as the
+// board's "Talks in chat" and the name comes back through POST /screen {"chat"} (ui_chat), so
+// nothing here changes the glass; a refusal is shown as a toast.
+
+#define CHATS_BUF 4096                 // 40 names and the one it talks in, as JSON
+
+static void send_chats(void)
+{
+    char why[96] = "Sapphire did not answer";
+    cJSON *j = NULL;
+    char *body = heap_caps_malloc(CHATS_BUF, MALLOC_CAP_SPIRAM);
+    esp_http_client_handle_t c = body ? open_client("chats", HTTP_METHOD_GET, PRESS_WAIT_MS) : NULL;
+    if (c) {
+        if (esp_http_client_open(c, 0) == ESP_OK && esp_http_client_fetch_headers(c) >= 0) {
+            int n = esp_http_client_read_response(c, body, CHATS_BUF - 1);
+            body[n > 0 ? n : 0] = 0;
+            int status = esp_http_client_get_status_code(c);
+            if (status == 200) j = cJSON_Parse(body);
+            else if (status == 404) strlcpy(why, "Sapphire is too old for this: update her", sizeof why);
+            else snprintf(why, sizeof why, "Sapphire answered %d", status);
+        }
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    free(body);
+    const cJSON *list = j ? cJSON_GetObjectItem(j, "chats") : NULL, *now = j ? cJSON_GetObjectItem(j, "chat") : NULL, *it;
+    if (!cJSON_IsArray(list)) {
+        const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;   // her refusal in her words (devices off, no such device), not a guess
+        if (cJSON_IsString(e) && e->valuestring[0]) strlcpy(why, e->valuestring, sizeof why);
+        ESP_LOGW(TAG, "chats: %s", why); ui_toast(why, 6); cJSON_Delete(j); return;
+    }
+    size_t cap = 1;                                    // the names one a line, as the picker takes them
+    cJSON_ArrayForEach(it, list) if (cJSON_IsString(it)) cap += strlen(it->valuestring) + 1;
+    char *joined = malloc(cap);
+    if (joined) {
+        char *w = joined;
+        *w = 0;
+        cJSON_ArrayForEach(it, list) {
+            if (!cJSON_IsString(it) || !it->valuestring[0]) continue;
+            if (w != joined) *w++ = '\n';
+            size_t n = strlen(it->valuestring);
+            memcpy(w, it->valuestring, n);
+            w += n;
+            *w = 0;
+        }
+        if (!ui_chats_open(joined, cJSON_IsString(now) ? now->valuestring : "")) ui_toast("No chat to pick from", 4);
+        free(joined);
+    }
+    cJSON_Delete(j);
+}
+
+static void send_pick(const char *name)
+{
+    cJSON *ask = cJSON_CreateObject();
+    cJSON_AddStringToObject(ask, "name", name);
+    char *out = cJSON_PrintUnformatted(ask);
+    cJSON_Delete(ask);
+    if (!out) return;
+    size_t len = strlen(out);
+    char body[384] = {0}, why[96] = "Sapphire did not answer";
+    bool ok = false;
+    esp_http_client_handle_t c = open_client("chat", HTTP_METHOD_POST, PRESS_WAIT_MS);
+    if (c) {
+        esp_http_client_set_header(c, "Content-Type", "application/json");
+        if (esp_http_client_open(c, len) == ESP_OK && esp_http_client_write(c, out, len) == (int)len
+                && esp_http_client_fetch_headers(c) >= 0) {
+            int n = esp_http_client_read_response(c, body, sizeof body - 1);
+            if (n > 0) body[n] = 0;
+            int status = esp_http_client_get_status_code(c);
+            cJSON *j = cJSON_Parse(body);
+            const cJSON *e = j ? cJSON_GetObjectItem(j, "error") : NULL;
+            ok = status == 200 && j && cJSON_IsTrue(cJSON_GetObjectItem(j, "ok"));
+            if (!ok && cJSON_IsString(e)) strlcpy(why, e->valuestring, sizeof why);
+            else if (!ok) snprintf(why, sizeof why, "Sapphire answered %d", status);
+            cJSON_Delete(j);
+        }
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    cJSON_free(out);
+    ESP_LOGI(TAG, "chat '%s': %s", name, ok ? "picked; the name comes back through /screen" : why);
+    if (!ok) ui_toast(why, 8);
+}
+
 static void press_task(void *arg)
 {
     press_t p;
     for (;;)
         if (xQueueReceive(presses, &p, portMAX_DELAY) == pdTRUE) {
-            if (p.job[0]) send_ask(p.job);
+            if (p.kind == 'c') send_chats();
+            else if (p.kind == 'C') send_pick(p.pick);
+            else if (p.job[0]) send_ask(p.job);
             else send_press(&p);
         }
 }
@@ -288,6 +376,28 @@ void link_press(const char *button, const char *how)
     strlcpy(p.how, how, sizeof p.how);
     if (!presses || !net_up() || xQueueSend(presses, &p, 0) != pdTRUE) { light_cue("error"); return; }
     light_cue("thinking");                       // at once: her own cue follows when the turn starts
+}
+
+void link_tap(const char *zone)
+{
+    press_t p = {.quiet = true};
+    strlcpy(p.button, zone, sizeof p.button);
+    strlcpy(p.how, "short", sizeof p.how);
+    if (!presses || !net_up() || xQueueSend(presses, &p, 0) != pdTRUE) light_cue("error");
+}
+
+void link_ask_chats(void)
+{
+    press_t p = {.kind = 'c'};
+    if (!presses || !net_up() || xQueueSend(presses, &p, 0) != pdTRUE) ui_toast("No link to Sapphire", 6);
+}
+
+void link_pick_chat(const char *name)
+{
+    press_t p = {.kind = 'C'};
+    strlcpy(p.pick, name ? name : "", sizeof p.pick);
+    if (!p.pick[0]) return;
+    if (!presses || !net_up() || xQueueSend(presses, &p, 0) != pdTRUE) ui_toast("No link: the chat was not picked", 6);
 }
 
 // --- what the light should show ------------------------------------------------------

@@ -173,6 +173,7 @@ static esp_err_t on_health(httpd_req_t *req)
     cJSON_AddStringToObject(j, "slot", ota_slot());
     cJSON *has = cJSON_AddArrayToObject(j, "has");
     cJSON_AddItemToArray(has, cJSON_CreateString("keyboard"));
+    cJSON_AddItemToArray(has, cJSON_CreateString("picker"));     // the chat picker in the bar: what the Devices page's Browse chats is for (Sapphire took `keyboard` for it before the name existed)
     cJSON_AddItemToArray(has, cJSON_CreateString("screen"));
     cJSON_AddItemToArray(has, cJSON_CreateString("light"));
     cJSON_AddItemToArray(has, cJSON_CreateString("power"));

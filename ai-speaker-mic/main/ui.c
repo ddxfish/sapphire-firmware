@@ -27,20 +27,47 @@
 #include "wake.h"
 
 static const char *TAG = "ui";
-#define ZONE 72                        // a corner's touch zone, px
-#define MIDDLE 120
+#define ZONE 72                        // a corner's touch zone: this wide, half the glass tall
+#define BAND 72                        // the top and bottom places, between the corners
 #define HEARD_S 8
 #define PICTURE_MAX_S 3600
+#define HOLD_MS 1200          // a finger down this long is a hold (a corner's dial, leaving a game); anything shorter is a tap
 
 static lv_display_t *disp;
 static lv_indev_t *indev;
 static bool ok;
 static lv_obj_t *scene, *picture, *shade, *catcher, *chat_lbl, *clock_lbl, *heard, *toast, *halo, *glow, *state_lbl;
-static lv_obj_t *zone[4], *zone_btn[4], *zone_lbl[4];
+// Seven places to touch, tiling the glass with no gap (0.9.0): every tap lands in one.
+// The same table draws them, names the one under a finger (zone_at) and is said in
+// /health as screen.zones, so Sapphire never hard-codes a pixel. The corners are the
+// four round buttons (drawn 72x72 in the corner, the tap area taller); top, bottom and
+// middle have no button drawn. All seven are buttons by name (main.c BUTTONS).
+#define ZONES_N 7
+static const ui_zone_t ZONES[ZONES_N] = {
+    {"top-left", 0, 0, ZONE, BOARD_H / 2},
+    {"top-right", BOARD_W - ZONE, 0, ZONE, BOARD_H / 2},
+    {"bottom-left", 0, BOARD_H / 2, ZONE, BOARD_H / 2},
+    {"bottom-right", BOARD_W - ZONE, BOARD_H / 2, ZONE, BOARD_H / 2},
+    {"top", ZONE, 0, BOARD_W - 2 * ZONE, BAND},
+    {"bottom", ZONE, BOARD_H - BAND, BOARD_W - 2 * ZONE, BAND},
+    {"middle", ZONE, BAND, BOARD_W - 2 * ZONE, BOARD_H - 2 * BAND},
+};
+static lv_obj_t *zone[ZONES_N], *zone_btn[4], *zone_lbl[4];
+static lv_obj_t *picker, *picker_scrim;   // the chat picker (0.9.1): a dropdown whose button is never seen; its list drops up from the chat's name
+// A stream whose sender asked for the taps (?taps=1): a tap on it names its place
+// to Sapphire (link_tap) and dismisses nothing; a long press is the way out.
+static bool stream_taps;
+// The long press happened: the stream's next tapping frame within STREAM_LEFT_S is answered hidden,
+// once. Its sender sends one again within half that while nothing moves (core/devices/glass.py), so
+// the word reaches it; a flag kept for good ate the FIRST frame of the next game, minutes later (2026-10-25).
+#define STREAM_LEFT_S 75
+static int64_t stream_left_until_us;
 static lv_obj_t *status_card, *status_text_lbl;
 static lv_obj_t *dial_card, *dial_lbl;
 static int dial_kind;
 static void status_fill(void);
+static bool take(void);
+static lv_obj_t *plain(lv_obj_t *parent);
 static lv_timer_t *tick, *heard_timer, *toast_timer, *picture_timer;
 static char status_text[48], scene_name[64], chat_name[32], brain_name[48];   // a scene's name is 50 at most: cut short, Sapphire took it for another and sent it again and again
 static int trim = -1;                  // the chat's trim color as 0xRRGGBB, -1 = none: the middle wears it while she rests
@@ -69,6 +96,7 @@ static int frames_painted, frames_replaced;
 
 static void stream_stop(void)
 {
+    stream_taps = false;
     free(next_px);
     next_px = NULL;
     if (frame_timer) { lv_timer_delete(frame_timer); frame_timer = NULL; }
@@ -117,11 +145,14 @@ static void image_free(int kind)
     im->filling = false;
 }
 
-static void on_picture_end(lv_timer_t *t)
+// The picture leaves the glass. One still landing keeps its memory (the decoder writes
+// into px with no lock held, server.c): only the one on the glass goes, and ui_frame_ready
+// shows or drops the landing one once it is whole. Freeing it here was a write into
+// memory given back (0.9.3).
+static void picture_drop(void)
 {
     image_t *im = &images[UI_PICTURE];
-    stream_stop();                             // no frame for `seconds`: a stream is over
-    if (im->filling) {                         // the next one is landing: only the one on the glass goes
+    if (im->filling) {
         lv_image_set_src(picture, NULL);
         lv_obj_set_hidden(picture, true);
         lv_obj_set_hidden(shade, true);
@@ -130,6 +161,12 @@ static void on_picture_end(lv_timer_t *t)
     } else {
         image_free(UI_PICTURE);
     }
+}
+
+static void on_picture_end(lv_timer_t *t)
+{
+    stream_stop();                             // no frame for `seconds`: a stream is over
+    picture_drop();
     lv_timer_delete(picture_timer);
     picture_timer = NULL;
 }
@@ -147,7 +184,7 @@ static void picture_end(void)
 {
     if (picture_timer) { lv_timer_delete(picture_timer); picture_timer = NULL; }
     stream_stop();
-    image_free(UI_PICTURE);
+    picture_drop();
 }
 
 // --- what the zones do ---------------------------------------------------------------
@@ -171,6 +208,7 @@ static int64_t stream_hide_until_us;
 static bool tap_taken(void)
 {
     if (!screen_on || dimmed || asleep) { wake_screen(); return true; }
+    if (stream_taps) return false;             // a game owns the taps: nothing here ends it (the long press does)
     if (images[UI_PICTURE].px && !images[UI_PICTURE].filling) {
         if (images[UI_PICTURE].dsc.header.cf == LV_COLOR_FORMAT_RGB565_SWAPPED) {   // a stream's frames (ui_frame_ready)
             stream_hidden = true;
@@ -182,14 +220,78 @@ static bool tap_taken(void)
     return false;
 }
 
-// A corner is a button like any other (buttons.h): its tap does what Sapphire
+// A place is a button like any other (buttons.h): its tap does what Sapphire
 // set for it, else its own job. The job runs on the buttons' task.
-static const char *CORNER[4] = {"top-left", "top-right", "bottom-left", "bottom-right"};
+#define CORNER(i) ZONES[i].name                 // the first four are the corners
 
 static void on_zone(lv_event_t *e)
 {
     if (tap_taken()) return;
-    buttons_tap(CORNER[(int)(intptr_t)lv_event_get_user_data(e)]);
+    buttons_tap(ZONES[(int)(intptr_t)lv_event_get_user_data(e)].name);
+}
+
+static int zone_at(int x, int y)
+{
+    for (int i = 0; i < ZONES_N; i++)
+        if (x >= ZONES[i].x && x < ZONES[i].x + ZONES[i].w && y >= ZONES[i].y && y < ZONES[i].y + ZONES[i].h) return i;
+    return -1;
+}
+
+int ui_zones(const ui_zone_t **zones) { *zones = ZONES; return ZONES_N; }
+
+// --- the chat picker: the bottom place (the chat's name) opens it ------------------------
+// The `chats` job asks Sapphire for the list (link_ask_chats); when it comes, ui_chats_open
+// fills the dropdown and opens it UP from the pill, the chat it talks in selected. A tap on a
+// name is the pick (link_pick_chat); a tap beside the list (the scrim under it) closes it.
+// The dropdown's own button is never pressed, so LVGL would not close the list on a tap
+// elsewhere (it sends LEAVE to the object last pressed, a place): the scrim does.
+
+static void scrim_down(void)
+{
+    if (picker_scrim) { lv_obj_delete(picker_scrim); picker_scrim = NULL; }
+}
+
+static void on_scrim(lv_event_t *e) { lv_dropdown_close(picker); }     // nothing picked; CANCEL takes the scrim down
+
+// A picture lands, the glass goes dark: the list goes. Left open it stayed on top for
+// taps while a stream's frames painted over it, unseen (0.9.3).
+static void picker_close(void)
+{
+    if (picker && lv_dropdown_is_open(picker)) lv_dropdown_close(picker);   // CANCEL takes the scrim down
+    scrim_down();
+}
+
+static void on_picker(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CANCEL) scrim_down();
+    else if (code == LV_EVENT_VALUE_CHANGED) {
+        char name[64];
+        lv_dropdown_get_selected_str(picker, name, sizeof name);
+        if (name[0] && strcmp(name, chat_name)) link_pick_chat(name);   // Sapphire keeps it and sends the name back (ui_chat)
+    }
+}
+
+bool ui_chats_open(const char *joined, const char *current)
+{
+    if (!ok || !joined || !joined[0] || !take()) return false;
+    scrim_down();
+    lv_dropdown_set_options(picker, joined);
+    int32_t at = current && current[0] ? lv_dropdown_get_option_index(picker, current) : -1;
+    lv_dropdown_set_selected(picker, at >= 0 ? at : 0);
+    picker_scrim = plain(lv_screen_active());          // under the list: lv_dropdown_open puts the list on top of the screen
+    lv_obj_set_size(picker_scrim, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(picker_scrim, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(picker_scrim, LV_OPA_50, 0);
+    lv_obj_set_clickable(picker_scrim, true);
+    lv_obj_add_event_cb(picker_scrim, on_scrim, LV_EVENT_CLICKED, NULL);
+    lv_dropdown_open(picker);
+    lv_obj_t *list = lv_dropdown_get_list(picker);         // LVGL hangs the list off the picker's left edge: centre it
+    lv_obj_update_layout(list);
+    lv_obj_align_to(list, picker, LV_ALIGN_OUT_TOP_MID, 0, 0);
+    wake_screen();                                         // a list on a dark glass took a blind pick
+    lvgl_port_unlock();
+    return true;
 }
 
 // --- the dial: a corner held down opens the slider of what that corner does ------------
@@ -225,7 +327,7 @@ static void on_zone_held(lv_event_t *e)
 {
     if (tap_taken() || dial_card) return;
     char job[BUTTON_JOB];
-    if (!buttons_does(CORNER[(int)(intptr_t)lv_event_get_user_data(e)], PRESS_SHORT, job, sizeof job)) return;
+    if (!buttons_does(CORNER((int)(intptr_t)lv_event_get_user_data(e)), PRESS_SHORT, job, sizeof job)) return;
     int least = 0, now;
     if (!strcmp(job, "mute") || !strcmp(job, "louder") || !strcmp(job, "quieter")) { dial_kind = DIAL_VOLUME; now = audio_volume(); }
     else if (!strcmp(job, "screen")) { dial_kind = DIAL_SCREEN; now = settings.brightness; least = 5; }   // at 0 the slider could not be seen
@@ -262,14 +364,34 @@ static void on_zone_held(lv_event_t *e)
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -6);
 }
 
-static void on_middle(lv_event_t *e)
+// A tap on a picture or a stream. Under a stream that asked for the taps the place
+// under the finger goes to Sapphire by name, raw (not through the buttons' table: a game
+// owns the glass while it runs); a dark glass is only woken. Else today's tap-away.
+static void on_catcher(lv_event_t *e)
 {
-    if (tap_taken()) return;
-    if (server_talking() || light_turn_on()) { server_stop_by_hand(); ESP_LOGI(TAG, "tap: stop"); }   // while her turn goes on a tap only ever stops her
-    else { wake_trigger(); ESP_LOGI(TAG, "tap: listen"); }
+    if (stream_taps && images[UI_PICTURE].px && !images[UI_PICTURE].filling) {
+        if (!screen_on || dimmed || asleep) { wake_screen(); return; }
+        lv_point_t p;
+        lv_indev_get_point(lv_indev_active(), &p);
+        int z = zone_at(p.x, p.y);
+        if (z >= 0) link_tap(ZONES[z].name);
+        return;
+    }
+    tap_taken();
 }
 
-static void on_catcher(lv_event_t *e) { tap_taken(); }
+// Held on a tapping stream: the way out that needs nothing of Sapphire. The board's own
+// page is back (as a tap-away, STREAM_HIDE_S) and the stream's next frame is answered
+// hidden, which its sender reads as "the player left" (core/devices/glass.py).
+static void on_catcher_held(lv_event_t *e)
+{
+    if (!stream_taps) { tap_taken(); return; }
+    stream_left_until_us = esp_timer_get_time() + STREAM_LEFT_S * 1000000LL;
+    stream_hidden = true;
+    stream_hide_until_us = esp_timer_get_time() + STREAM_HIDE_S * 1000000LL;
+    picture_end();
+    ESP_LOGI(TAG, "held: the game is left");
+}
 
 // --- the tick: the ring's color, the state, the clock, the backlight ------------------
 
@@ -288,7 +410,7 @@ static void draw_zones(void)
     for (int i = 0; i < 4; i++) {
         char job[BUTTON_JOB];
         int sign = -1;
-        if (buttons_does(CORNER[i], PRESS_SHORT, job, sizeof job))
+        if (buttons_does(CORNER(i), PRESS_SHORT, job, sizeof job))
             for (int k = 0; k < (int)(sizeof SIGNS / sizeof SIGNS[0]); k++)
                 if (!strcmp(job, SIGNS[k].job)) sign = k;
         bool lit = sign >= 0 && on[sign];
@@ -345,9 +467,11 @@ static void on_tick(lv_timer_t *t)
     if (screen_on && !busy && !asleep && settings.off_after_min && alone > (uint32_t)settings.off_after_min * 60000) {
         asleep = true;
         board_backlight(0);
+        picker_close();
     } else if (screen_on && !busy && !asleep && !dimmed && settings.dim_after_s && alone > (uint32_t)settings.dim_after_s * 1000) {
         dimmed = true;
         board_backlight(settings.dim_percent);
+        picker_close();
     }
     if (status_card && n % 10 == 0) status_fill();
 }
@@ -433,9 +557,9 @@ static void on_status_close(lv_event_t *e)
     status_card = NULL;
 }
 
-static void on_about(lv_event_t *e)
+static void status_open(void)
 {
-    if (tap_taken() || status_card) return;
+    if (status_card) return;
     status_card = plain(lv_layer_top());
     lv_obj_set_size(status_card, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(status_card, lv_color_black(), 0);
@@ -474,7 +598,8 @@ static void build(void)
     catcher = plain(scr);                               // a tap anywhere: wake the glass, end a picture
     lv_obj_set_size(catcher, LV_PCT(100), LV_PCT(100));
     lv_obj_set_clickable(catcher, true);
-    lv_obj_add_event_cb(catcher, on_catcher, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(catcher, on_catcher, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(catcher, on_catcher_held, LV_EVENT_LONG_PRESSED, NULL);
 
     // top middle: the clock, her state under it. Bottom middle: the chat this board talks in.
     // Each on a dark pill, so it reads over any scene (laid out 2026-10-09).
@@ -483,11 +608,6 @@ static void build(void)
     lv_obj_align(clock_lbl, LV_ALIGN_TOP_MID, 0, 6);
     state_lbl = small_label(scr, &lv_font_montserrat_14, C_TEXT);
     lv_obj_align(state_lbl, LV_ALIGN_TOP_MID, 0, 44);
-    lv_obj_t *about = plain(scr);                       // the clock and its gear: the status page
-    lv_obj_set_size(about, BOARD_W - 2 * ZONE - 8, 46);
-    lv_obj_align(about, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_clickable(about, true);
-    lv_obj_add_event_cb(about, on_about, LV_EVENT_CLICKED, NULL);
     chat_lbl = small_label(scr, &lv_font_montserrat_16, C_TEXT);
     pill(chat_lbl);
     lv_obj_set_style_max_width(chat_lbl, BOARD_W - 2 * ZONE - 8, 0);
@@ -495,12 +615,56 @@ static void build(void)
     lv_obj_align(chat_lbl, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_set_hidden(chat_lbl, true);
 
-    // the middle: the ring's color as a halo; a tap listens or stops her
-    lv_obj_t *mid = plain(scr);
-    lv_obj_set_size(mid, MIDDLE, MIDDLE);
-    lv_obj_center(mid);
-    lv_obj_set_clickable(mid, true);
-    lv_obj_add_event_cb(mid, on_middle, LV_EVENT_CLICKED, NULL);
+    // the chat picker over the name: nothing of its own to see (the bottom place opens it)
+    picker = lv_dropdown_create(scr);
+    lv_obj_remove_style_all(picker);
+    lv_obj_set_size(picker, 240, 28);                      // the list is at least this wide
+    lv_obj_align(picker, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_clickable(picker, false);
+    lv_dropdown_set_dir(picker, LV_DIR_TOP);
+    lv_dropdown_set_symbol(picker, NULL);
+    lv_dropdown_set_text(picker, "");
+    lv_dropdown_set_options(picker, "");
+    lv_obj_add_event_cb(picker, on_picker, LV_EVENT_ALL, NULL);
+    lv_obj_t *list = lv_dropdown_get_list(picker);
+    lv_obj_set_style_text_font(list, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(list, C_TEXT, 0);
+    lv_obj_set_style_text_line_space(list, 24, 0);          // a 46 px row: a finger's (0.9.2)
+    lv_obj_set_style_bg_color(list, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(list, lv_color_hex(0x3a4048), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+    lv_obj_set_style_radius(list, 8, 0);
+    lv_obj_set_style_pad_ver(list, 6, 0);
+    lv_obj_set_style_pad_hor(list, 10, 0);
+    lv_obj_set_style_max_height(list, 4 * 46 + 12, 0);     // four names show; the rest scroll
+    lv_obj_set_style_max_width(list, BOARD_W - 16, 0);     // a long name is cut, never off the glass
+    lv_obj_set_style_bg_color(list, C_BTN_ON, LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED);
+
+    // the seven places (ZONES): the corners wear a round button, the middle the ring's color as a halo
+    static const lv_align_t where[4] = {LV_ALIGN_TOP_LEFT, LV_ALIGN_TOP_RIGHT, LV_ALIGN_BOTTOM_LEFT, LV_ALIGN_BOTTOM_RIGHT};
+    for (int i = 0; i < ZONES_N; i++) {
+        zone[i] = plain(scr);
+        lv_obj_set_pos(zone[i], ZONES[i].x, ZONES[i].y);
+        lv_obj_set_size(zone[i], ZONES[i].w, ZONES[i].h);
+        lv_obj_set_clickable(zone[i], true);
+        lv_obj_add_event_cb(zone[i], on_zone, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);   // not the release of a hold
+        if (i >= 4) continue;
+        lv_obj_add_event_cb(zone[i], on_zone_held, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);   // a corner held: its dial
+        zone_btn[i] = plain(zone[i]);                   // a round button: sapphire when on, dark when off
+        lv_obj_set_size(zone_btn[i], BUTTON, BUTTON);
+        lv_obj_align(zone_btn[i], where[i], (i % 2) ? -6 : 6, (i < 2) ? 6 : -6);
+        lv_obj_set_style_radius(zone_btn[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(zone_btn[i], LV_OPA_80, 0);
+        lv_obj_set_style_border_color(zone_btn[i], lv_color_hex(0x3a4048), 0);
+        lv_obj_set_style_border_width(zone_btn[i], 1, 0);
+        lv_obj_set_clickable(zone_btn[i], false);       // the whole zone takes the tap
+        zone_lbl[i] = small_label(zone_btn[i], &lv_font_montserrat_28, C_DIM);
+        lv_obj_center(zone_lbl[i]);
+        lv_obj_set_clickable(zone_lbl[i], false);
+    }
+    lv_obj_t *mid = zone[6];
     glow = plain(mid);                                  // two plain circles: a blurred shadow costs a redraw dearly
     lv_obj_set_size(glow, 76, 76);
     lv_obj_center(glow);
@@ -526,28 +690,6 @@ static void build(void)
     lv_obj_align(heard, LV_ALIGN_BOTTOM_MID, 0, -40);          // between the two lower corners, over the chat's name
     lv_obj_set_hidden(heard, true);
 
-    // the four corners
-    static const lv_align_t where[4] = {LV_ALIGN_TOP_LEFT, LV_ALIGN_TOP_RIGHT, LV_ALIGN_BOTTOM_LEFT, LV_ALIGN_BOTTOM_RIGHT};
-    for (int i = 0; i < 4; i++) {
-        zone[i] = plain(scr);
-        lv_obj_set_size(zone[i], ZONE, ZONE);
-        lv_obj_align(zone[i], where[i], 0, 0);
-        lv_obj_set_clickable(zone[i], true);
-        lv_obj_add_event_cb(zone[i], on_zone, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);   // not the release of a hold
-        lv_obj_add_event_cb(zone[i], on_zone_held, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
-        zone_btn[i] = plain(zone[i]);                   // a round button: sapphire when on, dark when off
-        lv_obj_set_size(zone_btn[i], BUTTON, BUTTON);
-        lv_obj_align(zone_btn[i], where[i], (i % 2) ? -6 : 6, (i < 2) ? 6 : -6);
-        lv_obj_set_style_radius(zone_btn[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(zone_btn[i], LV_OPA_80, 0);
-        lv_obj_set_style_border_color(zone_btn[i], lv_color_hex(0x3a4048), 0);
-        lv_obj_set_style_border_width(zone_btn[i], 1, 0);
-        lv_obj_set_clickable(zone_btn[i], false);       // the whole zone takes the tap
-        zone_lbl[i] = small_label(zone_btn[i], &lv_font_montserrat_28, C_DIM);
-        lv_obj_center(zone_lbl[i]);
-        lv_obj_set_clickable(zone_lbl[i], false);
-    }
-
     // her picture, over everything but the toast. Under it the shade: the whole glass
     // dark (the chat's trim, nearly black) while a picture or a stream is up, so what
     // the image does not cover is not the scene and the buttons showing through (0.7.9)
@@ -558,11 +700,13 @@ static void build(void)
     lv_obj_set_style_bg_color(shade, lv_color_black(), 0);
     lv_obj_set_hidden(shade, true);
     lv_obj_set_clickable(shade, true);
-    lv_obj_add_event_cb(shade, on_catcher, LV_EVENT_CLICKED, NULL);   // a tap beside the image is a tap on it
+    lv_obj_add_event_cb(shade, on_catcher, LV_EVENT_SHORT_CLICKED, NULL);   // a tap beside the image is a tap on it
+    lv_obj_add_event_cb(shade, on_catcher_held, LV_EVENT_LONG_PRESSED, NULL);
     picture = lv_image_create(scr);
     lv_obj_set_hidden(picture, true);
     lv_obj_set_clickable(picture, true);
-    lv_obj_add_event_cb(picture, on_catcher, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(picture, on_catcher, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(picture, on_catcher_held, LV_EVENT_LONG_PRESSED, NULL);
 
     // her line across the top
     toast = lv_label_create(lv_layer_top());
@@ -620,6 +764,7 @@ void ui_start(void)
         lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
         lv_indev_set_read_cb(indev, on_touch_read);
         lv_indev_set_display(indev, disp);
+        lv_indev_set_long_press_time(indev, HOLD_MS);  // a hold is meant: at LVGL's 400 ms a firm press on a game's DEAL left the game (2026-10-25)
     }
     build();
     beat_us = esp_timer_get_time();
@@ -747,6 +892,7 @@ bool ui_image_show(int kind, int w, int h, int seconds, const char *name)
         else {
             picture_timer_arm(seconds);
             if (screen_on) wake_screen();
+            picker_close();
         }
         shown = true;
     }
@@ -819,14 +965,25 @@ static void on_frame_tick(lv_timer_t *t)
 // A decoded frame: the glass keeps what it shows until this one is painted, now if
 // the last paint is a beat or more behind, else when the beat comes. A frame already
 // waiting is dropped for it (the newest wins).
-bool ui_frame_ready(int w, int h, int seconds, bool *replaced)
+bool ui_frame_ready(int w, int h, int seconds, bool taps, bool *replaced)
 {
     if (replaced) *replaced = false;
     if (!ok || !take()) return false;
     image_t *im = &images[UI_PICTURE];
     bool taken = false;
+    if (im->px && im->filling && im->w == w && im->h == h && stream_hidden) {   // tapped away, or the game left by a hold, while this one landed: dropped (the door answers hidden)
+        free(im->px);
+        im->px = im->old;
+        im->old = NULL;
+        im->filling = false;
+        if (im->px) { im->w = im->dsc.header.w; im->h = im->dsc.header.h; }
+        lvgl_port_unlock();
+        return false;
+    }
     if (im->px && im->filling && im->w == w && im->h == h) {
         im->filling = false;
+        picker_close();
+        stream_taps = taps;                              // this sender owns the taps (or does not) from this frame on
         if (next_px) { free(next_px); frames_replaced++; if (replaced) *replaced = true; }
         next_px = im->px;
         next_w = w; next_h = h;
@@ -860,8 +1017,11 @@ static bool image_drop(int kind, bool mine)
         im->w = im->dsc.header.w; im->h = im->dsc.header.h;
         im->filling = false;
         if (!picture_timer) picture_timer_arm(0);
-    } else if (kind == UI_PICTURE) picture_end();
-    else { image_free(UI_SCENE); scene_name[0] = 0; }
+    } else if (kind == UI_PICTURE) {
+        if (mine) im->filling = false;                   // the one filling it says so: its memory may go
+        picture_end();
+        if (!mine) stream_left_until_us = 0;             // the sender is gone: a hold's "left" is for no one now
+    } else { image_free(UI_SCENE); scene_name[0] = 0; }
     lvgl_port_unlock();
     return true;
 }
@@ -872,12 +1032,28 @@ bool ui_image_abort(int kind) { return image_drop(kind, true); }
 const char *ui_scene_name(void) { return scene_name; }
 bool ui_picture_on(void) { return images[UI_PICTURE].px && !images[UI_PICTURE].filling; }
 bool ui_stream_hidden(void) { return stream_hidden; }
+bool ui_stream_left(void)
+{
+    bool was = stream_left_until_us && esp_timer_get_time() < stream_left_until_us;
+    stream_left_until_us = 0;
+    return was;
+}
+bool ui_stream_taps(void) { return stream_taps; }
+
+bool ui_status_open(void)
+{
+    if (!ok || !take()) return false;
+    wake_screen();
+    status_open();
+    lvgl_port_unlock();
+    return true;
+}
 
 bool ui_screen_power(bool on)
 {
     if (!ok || !take()) return false;
     if (on) wake_screen();
-    else { screen_on = false; board_backlight(0); }
+    else { screen_on = false; board_backlight(0); picker_close(); }
     lvgl_port_unlock();
     return true;
 }

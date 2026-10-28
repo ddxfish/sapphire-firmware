@@ -1,0 +1,14 @@
+# Cardputer TCA8418 keymap  Sun Oct 25 06:59:09 PM EDT 2026
+# number(s)  key    (a+b = modifier combo, e.g. Ctrl+key)
+1         ESC
+4+1       BACKTICK  `
+5         1
+11        2
+15        3
+21        4
+25        5
+31        6
+35        7
+41        8
+45        9
+51        0
