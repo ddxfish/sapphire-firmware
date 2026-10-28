@@ -5,11 +5,30 @@ uses as devices: a voice box, a touchscreen, a USB stick that keeps her backups.
 speaks the [Satellite Protocol](https://github.com/ddxfish/sapphire/blob/main/docs/SATELLITE-PROTOCOL.md),
 so Sapphire shows only what a board says it has.
 
-| Folder | Board | State |
-|---|---|---|
-| `ai-speaker-mic/` | Waveshare ESP32-S3-AUDIO-Board: mics, speaker, light ring, optional screen and camera | works |
-| `cyd/` | The reader, one program for two boards: `cyd28` (2.8" Cheap Yellow Display, ESP32-2432S028R, resistive XPT2046) and `cyd35` (3.5", ESP32-3248S035C, capacitive GT911). A page at a time, a chat picker, pages, rotation; `build.sh cyd28` or `cyd35` picks the board file under `cyd/main/boards/` | cyd28 works (2026-10-15); cyd35 builds, not yet proven on a board |
-| `tdongle/` | LilyGO T-Dongle-S3: a backup stick. A card for her backups, a small screen and an LED that say whether they are safe | works |
+## The boards
+
+| Device | Image | Features | Notes |
+|---|---|---|---|
+| **AI speaker and mic**<br>Waveshare ESP32-S3-AUDIO-Board<br>`ai-speaker-mic/` · 0.9.4 | | • Wake word<br>• Mic<br>• Speaker<br>• Light ring<br>• Screen (optional)<br>• Touch (optional)<br>• Camera (optional)<br>• Chat picker<br>• Buttons<br>• Backups<br>• Updates over WiFi | A voice box: say the wake word, ask, hear her answer. The screen is Waveshare's 2" touch LCD; the camera is any OV2640/OV3660/OV5640. |
+| **CYD 2.8" reader**<br>ESP32-2432S028R<br>`cyd/` (`cyd28`) · 0.5.2 | | • Screen<br>• Touch (resistive)<br>• Keyboard<br>• Chat picker<br>• Speaker<br>• LED<br>• Light sensor<br>• Buttons<br>• Backups<br>• Updates over WiFi | A chat in your pocket, a page at a time. Speaker needs an 8 Ω speaker on its JST 1.25 mm plug. |
+| **CYD 3.5" reader**<br>ESP32-3248S035C<br>`cyd/` (`cyd35`) · 0.5.2 | | • Screen<br>• Touch (capacitive)<br>• Keyboard<br>• Chat picker<br>• Speaker<br>• LED<br>• Light sensor<br>• Buttons<br>• Backups<br>• Updates over WiFi | Same program as the 2.8", bigger glass. Builds; not yet proven on a board. |
+| **Backup stick**<br>LilyGO T-Dongle-S3<br>`tdongle/` · 0.1.4 | | • Backups<br>• Screen<br>• LED<br>• Buttons<br>• Updates over WiFi | Plug into any USB power. Every backup is read back and checked at each start. |
+
+## What the features mean
+
+- **Wake word**: listens on the board for its word, then sends what you say to Sapphire.
+- **Mic**: Sapphire can listen through the board on demand; echo cancel and noise reduction on the board.
+- **Speaker**: Sapphire's voice plays there, sentence by sentence as she makes it.
+- **Light ring / LED**: shows what she is doing (thinking, speaking, a tool), and takes colors and animations she sets.
+- **Screen**: the board's own UI, plus her `show` line and pictures pushed to the glass.
+- **Touch**: tap to page, open menus and press the on-screen buttons.
+- **Keyboard**: type to her on the glass; her reply shows as she writes it.
+- **Chat picker**: choose which of her chats the board talks in.
+- **Camera**: she can take a picture through the board; it is powered only for the shot.
+- **Light sensor**: a room light reading she can ask for.
+- **Buttons**: each press can be set in Settings > Devices to send her a message or do a board job.
+- **Backups**: sealed copies of her memory kept on the board's SD card, checked against their hash.
+- **Updates over WiFi**: new firmware from Sapphire, into a second slot, with rollback if it fails to start.
 
 ## Put it on a board
 
