@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -52,7 +53,8 @@ static lv_timer_t *toast_timer, *clock_timer, *watch_timer;
 static char status_text[48];
 static bool dimmed, dark;              // dimmed comes by itself; dark is the button's "screen" job. A touch ends both
 static int64_t dark_at;                // when it went dark: the tap that asked for it is not the touch that ends it
-static volatile bool picture_on;       // server.c holds the glass and the LVGL lock
+static volatile bool picture_on;       // server.c holds the glass: LVGL's lock while it paints, LVGL stopped while it holds
+static volatile uint32_t beat_ms;      // LVGL's own timer, each second: the glass watch reads it
 static bool pending_begin;             // a reply began behind the picture
 static char *pending_reply;            // its text so far
 static portMUX_TYPE pend_mux = portMUX_INITIALIZER_UNLOCKED;   // the three above, between the events, client and picture tasks
@@ -364,7 +366,7 @@ static void on_send(lv_event_t *e) { send_now(); keyboard_hide(); }
 
 // A finger on the page. A swipe (50 px across) turns it the way it went; a
 // tap turns it by where it landed: the top half back, the bottom half on
-// (Krem, 2026-10-16: a target half the glass, on every board in every
+// (2026-10-16: a target half the glass, on every board in every
 // position; the arrows stay on a bar wide enough). LVGL would send a click
 // for a swipe too, so one handler reads the press and the release itself.
 static void on_page_touch(lv_event_t *e)
@@ -762,6 +764,24 @@ static void build(void)
     watch_timer = lv_timer_create(on_watch, 40, NULL);      // also acts on the button (buttons.c reads the pin itself)
 }
 
+// LVGL stuck (a touch or SPI hang) left the board silently dead: every door waits on its lock.
+// The speaker board's watch (2026-10-08), here: no beat for GLASS_STUCK_MS, outside a picture, restarts.
+#define GLASS_STUCK_MS 15000
+static void on_beat(lv_timer_t *t) { beat_ms = (uint32_t)(esp_timer_get_time() / 1000); }
+
+static void watch_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (picture_on) { beat_ms = now; continue; }      // stopped on purpose; the clock starts again after it
+        if (now - beat_ms > GLASS_STUCK_MS) {
+            ESP_LOGE(TAG, "the glass has not beaten for %lu ms: restarting", (unsigned long)(now - beat_ms));
+            esp_restart();
+        }
+    }
+}
+
 void ui_start(void)
 {
     const lvgl_port_cfg_t port = {.task_priority = 4, .task_stack = 8192, .task_affinity = 1, .task_max_sleep_ms = 500, .timer_period_ms = 5};
@@ -784,7 +804,10 @@ void ui_start(void)
     lv_indev_set_display(indev, disp);
     lv_indev_set_scroll_limit(indev, SCROLL_LIMIT);
     build();
+    beat_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    lv_timer_create(on_beat, 1000, NULL);
     lvgl_port_unlock();
+    xTaskCreatePinnedToCore(watch_task, "glass-watch", 2560, NULL, 6, NULL, 0);
     board_backlight(settings.brightness);
     ESP_LOGI(TAG, "screen up, %d px a page, font %d", page_h(), settings.font);
     if (board_touch_needs_cal() && !board_touch_calibrated()) {   // a fresh board (or one from before 0.5.0): the crosses first; after CAL_TIMEOUT_S the guess stays
@@ -1092,9 +1115,21 @@ bool ui_picture_begin(void)
     return true;
 }
 
+// Painted: LVGL is stopped (no timer, no draw, no touch read) and its lock let go.
+// Held the lock for the whole showing (60 s, up to an hour), every other task that
+// wanted it waited: the server, the events stream, WiFi's own event loop (scouts, 2026-10-28).
+void ui_picture_hold(void)
+{
+    if (!picture_on) return;
+    lvgl_port_stop();
+    lvgl_port_unlock();
+}
+
 void ui_picture_end(void)
 {
     if (!picture_on) return;
+    lvgl_port_lock(0);
+    lvgl_port_resume();
     for (;;) {                             // what came behind the picture, until nothing more does
         taskENTER_CRITICAL(&pend_mux);
         bool begin = pending_begin;

@@ -21,6 +21,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "auth.h"
 #include "board.h"
 #include "esp_lvgl_port.h"
 #include "buttons.h"
@@ -101,11 +102,14 @@ static bool same(const char *a, const char *b)
     return diff == 0;
 }
 
+// A request signed with the key (auth.h), or the key itself (Bearer: a Sapphire from before 0.5.2)
 static bool let_in(httpd_req_t *req)
 {
     char auth[SETTING_MAX + 8] = {0};
-    if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof auth) != ESP_OK
-        || strncmp(auth, "Bearer ", 7) || !settings.key[0] || !same(auth + 7, settings.key)) {
+    bool got = httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof auth) == ESP_OK;
+    if (got && auth_signed(req, auth, settings.key)) return true;
+    if (!got || strncmp(auth, "Bearer ", 7) || !settings.key[0] || !same(auth + 7, settings.key)) {
+        auth_board_time(req);
         if (req->content_len > UNREAD_BIG) httpd_resp_set_hdr(req, "Connection", "close");   // the caller returns ESP_FAIL: see refuse_unread
         refuse(req, 401, "wrong key");
         return false;
@@ -356,6 +360,7 @@ static void picture_work(httpd_req_t *req)
     esp_lcd_panel_handle_t panel = board()->panel;
     if (!bufs[0] || !bufs[1]) {
         free(bufs[0]); free(bufs[1]);
+        ui_picture_hold();
         ui_picture_end();
         refuse(req, 500, "no memory for a picture");
         httpd_req_async_handler_complete(req);
@@ -390,6 +395,8 @@ static void picture_work(httpd_req_t *req)
             have = 0;
         }
     }
+    vTaskDelay(1);                                         // the last strip's DMA, before LVGL's lock goes
+    ui_picture_hold();
     if (problem) refuse(req, 400, "the picture did not arrive whole");
     else {
         cJSON *j = cJSON_CreateObject();
@@ -398,7 +405,7 @@ static void picture_work(httpd_req_t *req)
         say_json(req, 200, j);
     }
     httpd_req_async_handler_complete(req);
-    // hold it: a tap, the button, or the time. LVGL is held, so the chip is ours to read
+    // hold it: a tap, the button, or the time. LVGL is stopped, so the touch chip is ours to read
     int64_t end = esp_timer_get_time() + (int64_t)seconds * 1000000;
     vTaskDelay(pdMS_TO_TICKS(400));                       // the tap that sent it is not the tap that ends it
     while (!problem && esp_timer_get_time() < end) {
@@ -557,11 +564,12 @@ static void speak_work(httpd_req_t *req)
     uint8_t *buf = malloc(SPEAK_CHUNK);
     size_t left = req->content_len, have = 0;
     wav_info_t info = {0};
-    bool headed = false, stopped = false;
+    bool headed = false, stopped = false, mine = false;
     int problem = buf ? 0 : 500;
     if (esp_timer_get_time() / 1000 < halted_until_ms) {
         stopped = true;                                  // the rest of a stopped reply: taken, not played
     } else {
+        mine = speaker_claim(4000);                      // a tone is at most 3 s
         cut = false;
         speaking = true;
         light_cue("speaking");
@@ -586,6 +594,7 @@ static void speak_work(httpd_req_t *req)
         have -= whole;
     }
     if (speaking) speaker_play_end();
+    if (mine) speaker_release();
     speaking = false;
     free(buf);
     light_cue("idle");

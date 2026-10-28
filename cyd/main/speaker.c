@@ -8,6 +8,7 @@
 #include "driver/dac_continuous.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "board.h"
@@ -22,11 +23,17 @@ static const char *TAG = "speaker";
 static dac_continuous_handle_t dac;
 static bool enabled;
 static uint8_t out[CHUNK];
-static volatile bool toning;           // a tone task is up
+// The DAC, `out` and the enable have one owner at a time: a tone's tail slept the DAC
+// in the middle of her sentence, and both wrote `out` (scouts, 2026-10-28).
+static SemaphoreHandle_t owner;
+
+bool speaker_claim(int wait_ms) { return owner && xSemaphoreTake(owner, pdMS_TO_TICKS(wait_ms)) == pdTRUE; }
+void speaker_release(void) { if (owner) xSemaphoreGive(owner); }
 
 bool speaker_start(void)
 {
     if (dac) return true;
+    if (!owner && (owner = xSemaphoreCreateBinary())) xSemaphoreGive(owner);   // binary, not a mutex: a tone is claimed on one task and let go on its own
     dac_continuous_config_t cfg = {
         .chan_mask = BOARD_AMP == 26 ? DAC_CHANNEL_MASK_CH1 : DAC_CHANNEL_MASK_CH0,
         .desc_num = DMA_BUFS,
@@ -94,15 +101,14 @@ static void tone_task(void *arg)
         done += n;
     }
     speaker_play_end();
-    toning = false;
+    speaker_release();
     vTaskDelete(NULL);
 }
 
 void speaker_tone(int hz, int ms)
 {
-    if (!dac || enabled || toning || hz < 50 || hz > 5000 || ms < 20 || ms > 3000) return;   // one at a time, never over her voice: the DAC and `out` are shared
-    toning = true;
-    if (xTaskCreate(tone_task, "tone", 6144, (void *)(intptr_t)(hz << 16 | ms), 4, NULL) != pdPASS) toning = false;   // play converts through a 1 KB buffer on this stack
+    if (!dac || hz < 50 || hz > 5000 || ms < 20 || ms > 3000 || !speaker_claim(0)) return;   // one at a time, never over her voice
+    if (xTaskCreate(tone_task, "tone", 6144, (void *)(intptr_t)(hz << 16 | ms), 4, NULL) != pdPASS) speaker_release();   // play converts through a 1 KB buffer on this stack
 }
 
 void speaker_play_end(void)

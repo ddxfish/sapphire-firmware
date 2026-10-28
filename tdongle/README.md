@@ -57,7 +57,7 @@ seconds; one byte flipped in it on the card was found at the next start.
 
 ## Set up a stick
 
-Settings > Devices > **+ New Board** in Sapphire (Chrome or Edge), or from a
+Settings > Devices > **+ Add Satellite** > **Dev board** in Sapphire (Chrome or Edge), or from a
 terminal: `python setup_board.py flash`, then `setup`, then `test`.
 
 A stick that still runs MicroPython or another program does not enter its

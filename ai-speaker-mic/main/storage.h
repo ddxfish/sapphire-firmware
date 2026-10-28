@@ -11,6 +11,7 @@
 // is the board's own check, on top of Sapphire's.
 #pragma once
 #include <stdbool.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -29,13 +30,15 @@ bool storage_path(const char *name, char *out, size_t size);     // dir + name
 typedef struct storage_write storage_write_t;
 storage_write_t *storage_write_begin(const char *name, uint64_t expect);
 bool storage_write_feed(storage_write_t *w, const uint8_t *data, size_t n);
-bool storage_write_finish(storage_write_t *w, char sha_hex[65], uint64_t *size);
+bool storage_write_finish(storage_write_t *w, const char *want, char sha_hex[65], uint64_t *size, bool *mismatch);   // want: the sender's sha256, or NULL
 void storage_write_drop(storage_write_t *w);
 const char *storage_last_error(void);          // the card's words on the last write that went wrong; "" after a good one (0.7.8)
 
 bool storage_format(void);                    // wipe + FAT32; refuses while busy
 bool storage_busy(void);                      // a write or a format is on
 bool storage_remove(const char *name);        // a file and the hash beside it
+FILE *storage_read_open(const char *name);    // holds the card (no write, format or remount) until storage_read_close
+void storage_read_close(FILE *f);
 
 // A board whose board.h says BOARD_STORAGE_CHECKS reads every backup back
 // after writing it, keeps its sha256 beside it (name.sha256, never listed)

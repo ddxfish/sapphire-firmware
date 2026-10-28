@@ -391,7 +391,7 @@ lv_obj_t *page_backups_build(lv_obj_t *parent)
 }
 
 // --- board -----------------------------------------------------------------------------------------
-// Knobs and sliders (Krem, 2026-10-16): the LED to play with, the backlight,
+// Knobs and sliders (2026-10-16): the LED to play with, the backlight,
 // how the glass sits, the chat font, her volume, a tone, and the system row.
 // A slider sets its thing as it moves and the flash word once let go of.
 
@@ -632,7 +632,7 @@ lv_obj_t *page_actions_build(lv_obj_t *parent)
     lv_obj_update_layout(c);               // laid out now, so its height can be measured
     lv_obj_t *g = grid(c);
     int cols = board_w() >= 300 ? 3 : 2, bw = (board_w() - 16 - 6 * (cols - 1)) / cols;   // three a row on a wide glass, two on a narrow
-    int rows = (VBUTTONS + cols - 1) / cols, bh = (lv_obj_get_content_height(c) - 8 * (rows - 1)) / rows;   // the tiles fill the height too (Krem, 2026-10-16)
+    int rows = (VBUTTONS + cols - 1) / cols, bh = (lv_obj_get_content_height(c) - 8 * (rows - 1)) / rows;   // the tiles fill the height too (2026-10-16)
     if (bh < 44) bh = 44;                  // two lines of words: a glass shorter than that scrolls the page instead
     for (int i = 0; i < VBUTTONS; i++) {
         char words[VLABEL_MAX + 24];

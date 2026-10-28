@@ -10,6 +10,7 @@
 #include "cJSON.h"
 
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -27,6 +28,11 @@ static bool joined;
 static net_up_fn up_fn;
 static bool inited;              // esp_netif and esp_wifi are up: net_start, or a scan on a board not yet set up
 
+// The next try 3 s after a loss, from a timer: a sleep here held the system's event loop,
+// every other event queued behind it, at each retry of an outage (scouts, 2026-10-28).
+static esp_timer_handle_t rejoin;
+static void rejoin_now(void *arg) { esp_wifi_connect(); }
+
 static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (id == WIFI_EVENT_STA_START) {
@@ -37,8 +43,8 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         light_cue("nolink");
         ui_status("no WiFi");
         ESP_LOGW(TAG, "WiFi lost, joining again in 3 s");
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        esp_wifi_connect();
+        if (!rejoin) esp_timer_create(&(esp_timer_create_args_t){.callback = rejoin_now, .name = "rejoin"}, &rejoin);
+        if (rejoin) { esp_timer_stop(rejoin); esp_timer_start_once(rejoin, 3000 * 1000); }
     }
 }
 
@@ -111,7 +117,8 @@ void net_start(net_up_fn on_up)
 
     wifi_config_t cfg = {0};
     strlcpy((char *)cfg.sta.ssid, settings.wifi_ssid, sizeof cfg.sta.ssid);
-    strlcpy((char *)cfg.sta.password, settings.wifi_password, sizeof cfg.sta.password);
+    // all 64 bytes: a raw PSK is 64 hex digits with no room for an end, and strlcpy kept 63 (scouts, 2026-10-28)
+    memcpy(cfg.sta.password, settings.wifi_password, strnlen(settings.wifi_password, sizeof cfg.sta.password));
     cfg.sta.threshold.authmode = settings.wifi_password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     cfg.sta.pmf_cfg.capable = true;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));

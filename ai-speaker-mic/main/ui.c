@@ -790,6 +790,17 @@ static bool take(void)
     return false;
 }
 
+// The panel takes one command at a time: an orientation sent beside LVGL's flush
+// on the same SPI device could leave one of them waiting for ever (scouts, 2026-10-28).
+bool ui_orient(void)
+{
+    if (!ok) { board_glass_orient(settings.invert, settings.flip); return true; }
+    if (!take()) return false;
+    board_glass_orient(settings.invert, settings.flip);
+    lvgl_port_unlock();
+    return true;
+}
+
 int ui_beat_age_ms(void) { return ok ? (int)((esp_timer_get_time() - beat_us) / 1000) : -1; }
 int ui_doors_shut(void) { return doors_shut; }
 

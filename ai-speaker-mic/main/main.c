@@ -10,6 +10,7 @@
 
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -121,7 +122,7 @@ static const button_job_t JOBS[] = {
 // (the halo: listen, or stop her while she speaks).
 // Left alone, the real buttons are a remote for a board with no glass: volume at the two ends
 // (BOOT down, Key3 up), Key1 listens or stops her, Key2 is the ring, held the wake word, twice
-// the speaker (Krem's own set after a day of use, 2026-10-11).
+// the speaker (a user's own set after a day of use, 2026-10-11).
 #define FIRST_KEY 1
 static const button_def_t BUTTONS[] = {
     {"boot", BOARD_BOOT_BUTTON, {"quieter", NULL, NULL}},
@@ -147,8 +148,17 @@ static void buttons_task(void *arg)
     }
 }
 
+// cJSON's nodes are 40 bytes: under SPIRAM_MALLOC_ALWAYSINTERNAL each landed in the ~60 KB
+// of internal RAM, about 10 KB per /health (scouts, 2026-10-28). PSRAM first, internal if full.
+static void *json_alloc(size_t n)
+{
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+    return p ? p : malloc(n);
+}
+
 void app_main(void)
 {
+    cJSON_InitHooks(&(cJSON_Hooks){.malloc_fn = json_alloc, .free_fn = free});
     ESP_LOGI(TAG, "Sapphire satellite %s", PROJECT_VER);
     settings_load();
     lastwords_start();                   // why the last boot ended, before anything can end this one

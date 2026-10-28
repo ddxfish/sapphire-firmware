@@ -114,7 +114,16 @@ static volatile bool paused;            // a backup is landing: the board's own 
 static volatile bool forget;            // the model is to be reset, by the task that feeds it
 static bool running;
 static bool ready;                      // wake_start got to its end: the recording buffer and a model are there
-static state_t state;
+// One owner: the task that feeds the model (on_audio) begins and stands down recordings. Other
+// tasks only ask, through the flags below; the send and listen tasks hand SENDING back to IDLE.
+// Two writers of state once let a standdown land on a question already sending (scouts, 2026-10-28).
+static volatile state_t state;
+static volatile uint32_t rec_gen;      // counts recordings begun: a standdown names the one it is for
+static volatile uint32_t standdown_gen;
+static volatile bool trigger_asked;    // wake_trigger: a question by hand
+static volatile bool listen_asked;     // wake_record_now: a recording for /audio/listen
+static int listen_max_s;
+static bool listen_vad;
 static bool for_listen;                // the recording is for /audio/listen, not the wake word
 static bool plain;                     // /audio/listen?vad=false: the room for max_s seconds, no speech rules
 static int16_t *buf;                   // PSRAM, MAX_SAMPLES
@@ -152,20 +161,20 @@ static void begin(bool listen, size_t max_samples)
     began_us = last_speech_us = now_ms();
     for_listen = listen;
     plain = false;
+    rec_gen++;
     state = RECORDING;
     light_cue("listening");
     if (!listen) xSemaphoreGive(claim_now);          // alongside the recording, never before it
 }
 
-void wake_standdown(const char *who)
+static void stand_down(uint32_t gen, const char *who)
 {
-    if (state != RECORDING || for_listen) return;
+    if (state != RECORDING || for_listen) return;     // a hint only: on_audio checks again, as the owner
     ESP_LOGI(TAG, "standing down: the room is %s's", who && who[0] ? who : "another's");
-    server_reply_over();
-    state = IDLE;                                     // on_audio stops filling the buffer
-    forget = true;                                    // reset by the task that feeds the model, never under it
-    light_cue("idle");
+    standdown_gen = gen;
 }
+
+void wake_standdown(const char *who) { stand_down(rec_gen, who); }
 
 static void end(bool spoke)
 {
@@ -194,8 +203,28 @@ static void on_audio(const int16_t *pcm, size_t samples, bool speech)
         ring[ring_at] = pcm[i];
         ring_at = (ring_at + 1) % PREROLL;
     }
+    if (state == RECORDING && standdown_gen == rec_gen && !for_listen) {
+        standdown_gen = 0;
+        server_reply_over();
+        state = IDLE;
+        forget = true;
+        light_cue("idle");
+    }
     if (state == IDLE) {
         if (forget) { forget = false; mww_reset(); }
+        if (listen_asked) {
+            listen_asked = false;
+            begin(true, (size_t)AUDIO_RATE * listen_max_s);
+            plain = !listen_vad;
+            return;
+        }
+        if (trigger_asked) {
+            trigger_asked = false;
+            ESP_LOGI(TAG, "listening by hand");
+            begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
+            if (!deaf_until) deaf_until = now_ms() + TAP_MS;
+            return;
+        }
         if (enabled && !paused && mww_feed(pcm, samples)) {
             capture_fire(mww_last());                 // stamped into the piece it fell in, with its score
             if (capture_test()) { ESP_LOGI(TAG, "wake word (counted only: a capture in test mode)"); return; }
@@ -234,7 +263,7 @@ static void send_task(void *arg)
         if (ok) ESP_LOGI(TAG, "she heard: %s", heard[0] ? heard : "(nothing)");
         // Free to hear her before the glass is asked anything: its lock can take
         // half a second, and a first sentence met in that time was refused.
-        mww_reset();
+        forget = true;                            // the model is reset by the task that feeds it, never under it
         server_reply_over();                      // what she says now is the answer to this
         state = IDLE;
         if (!ok) light_cue("error");
@@ -248,8 +277,9 @@ static void claim_task(void *arg)
 {
     for (;;) {
         xSemaphoreTake(claim_now, portMAX_DELAY);
+        uint32_t gen = rec_gen;                   // the recording this claim is for, not one begun while it waited
         char who[64];
-        if (!link_claim_wake(who, sizeof who)) wake_standdown(who);
+        if (!link_claim_wake(who, sizeof who)) stand_down(gen, who);
     }
 }
 
@@ -298,9 +328,7 @@ void wake_trigger(void)
 {
     if (!ready || !audio_ok() || state != IDLE) return;
     if (paused) { ui_toast("Backup in progress", 3); return; }
-    ESP_LOGI(TAG, "listening by hand");
-    begin(false, (size_t)AUDIO_RATE * settings.question_max_s);
-    if (!deaf_until) deaf_until = now_ms() + TAP_MS;
+    trigger_asked = true;                             // begun by on_audio, the one owner
 }
 void wake_enable(bool on)
 {
@@ -366,14 +394,16 @@ bool wake_model_forget(void)
 
 bool wake_record_now(int max_s, bool use_vad, recording_t *out)
 {
-    if (!ready || !audio_ok() || state != IDLE) return false;
+    if (!ready || !audio_ok() || state != IDLE || listen_asked) return false;
     xSemaphoreTake(done, 0);
-    begin(true, (size_t)AUDIO_RATE * max_s);
-    plain = !use_vad;
+    listen_max_s = max_s;
+    listen_vad = use_vad;
+    listen_asked = true;                              // begun by on_audio, the one owner
     // Only the sound coming in ends a recording. If it has stopped, this wait was for ever, on
     // the web server's one task: the board was gone until a restart (scouts, 2026-10-11).
     if (xSemaphoreTake(done, pdMS_TO_TICKS((max_s + 5) * 1000)) != pdTRUE) {
         ESP_LOGE(TAG, "a recording did not end: no sound is coming in");
+        listen_asked = false;
         state = IDLE;
         light_cue("error");
         return false;
@@ -385,7 +415,7 @@ bool wake_record_now(int max_s, bool use_vad, recording_t *out)
 
 void wake_record_done(recording_t *rec)
 {
-    mww_reset();
+    forget = true;
     state = IDLE;
     light_cue("idle");
 }

@@ -18,4 +18,6 @@ void speaker_play(const int16_t *frames, size_t samples, int channels);   // blo
 void speaker_play_end(void);                           // the tail: drain, fade to silence
 int speaker_volume(void);                              // 0..100
 void speaker_set_volume(int level);                    // kept in flash
+bool speaker_claim(int wait_ms);                       // the DAC for one sentence or one tone; false: another has it
+void speaker_release(void);
 void speaker_tone(int hz, int ms);                     // a plain sine, on a task of its own: a check from the Board page

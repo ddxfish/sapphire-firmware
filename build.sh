@@ -52,12 +52,12 @@ else
     BUILD=build; EXTRA=(); NAME=""
 fi
 case "${2:-build}" in
-    clean) idf.py "${EXTRA[@]}" fullclean ;;
-    menuconfig) idf.py "${EXTRA[@]}" menuconfig ;;
-    *) if [ -f "$BUILD/sdkconfig" ] && [ sdkconfig.defaults -nt "$BUILD/sdkconfig" ] || [ -f sdkconfig ] && [ sdkconfig.defaults -nt sdkconfig ]; then
+    clean) idf.py ${EXTRA[@]+"${EXTRA[@]}"} fullclean ;;
+    menuconfig) idf.py ${EXTRA[@]+"${EXTRA[@]}"} menuconfig ;;
+    *) if { [ -f "$BUILD/sdkconfig" ] && [ sdkconfig.defaults -nt "$BUILD/sdkconfig" ]; } || { [ -f sdkconfig ] && [ sdkconfig.defaults -nt sdkconfig ]; }; then
            echo "sdkconfig.defaults changed: the configuration starts over"; rm -f "$BUILD/sdkconfig" sdkconfig   # idf.py keeps an old one over newer defaults
        fi
        mkdir -p "$BUILD"
-       idf.py "${EXTRA[@]}" build       # the target comes from sdkconfig.defaults
+       idf.py ${EXTRA[@]+"${EXTRA[@]}"} build       # the target comes from sdkconfig.defaults
        python "$HERE/tools/pack.py" "$BOARD" "$BUILD" "$HERE/dist" ${NAME:+--name "$NAME"} ;;
 esac

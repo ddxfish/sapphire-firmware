@@ -8,7 +8,7 @@ so Sapphire shows only what a board says it has.
 | Folder | Board | State |
 |---|---|---|
 | `ai-speaker-mic/` | Waveshare ESP32-S3-AUDIO-Board: mics, speaker, light ring, optional screen and camera | works |
-| `cyd/` | The reader, one program for two boards: `cyd28` (2.8" Cheap Yellow Display, ESP32-2432S028R, resistive XPT2046) and `cyd35` (3.5", ESP32-3248S035C, capacitive GT911). A page at a time, a chat picker, pages, rotation; `build.sh cyd28` or `cyd35` picks the board file under `cyd/main/boards/` | cyd28 works (2026-10-15); cyd35 built from the 0.4.5 pocket's glass and touch, eyes pending |
+| `cyd/` | The reader, one program for two boards: `cyd28` (2.8" Cheap Yellow Display, ESP32-2432S028R, resistive XPT2046) and `cyd35` (3.5", ESP32-3248S035C, capacitive GT911). A page at a time, a chat picker, pages, rotation; `build.sh cyd28` or `cyd35` picks the board file under `cyd/main/boards/` | cyd28 works (2026-10-15); cyd35 builds, not yet proven on a board |
 | `tdongle/` | LilyGO T-Dongle-S3: a backup stick. A card for her backups, a small screen and an LED that say whether they are safe | works |
 
 ## Put it on a board
@@ -35,7 +35,7 @@ one file per board into `dist/` (`tools/pack.py`):
 
 ```
 dist/index.json                 every board here: version, chip, sha256, what sits where in its file
-dist/cyd28-0.5.0.bin            the whole board: bootloader, partition table, program
+dist/cyd28-0.5.2.bin            the whole board: bootloader, partition table, program
 ```
 
 To flash your own build from Sapphire, set **DEVICE_FIRMWARE_SOURCE** in her
@@ -54,7 +54,7 @@ Download your board's `.bin` from the latest release and write it at address
 0 with any ESP flasher:
 
 ```
-esptool.py write_flash 0x0 cyd28-0.5.0.bin
+esptool.py write_flash 0x0 cyd28-0.5.2.bin
 ```
 
 This also clears the board's saved name and WiFi, so it starts as a new
@@ -73,7 +73,19 @@ board. Set it up in Sapphire afterwards (**+ Add Satellite**).
 A board that keeps two program slots (`partitions.csv`) and says `firmware`
 in `/health` gets its updates over WiFi after the first flash.
 
+## Security
+
+Sapphire signs every request it makes of a board with the board's key (see the protocol's
+"What Sapphire asks of the board"), so the key never crosses the network; the board's own calls to
+Sapphire go over TLS, pinned to her certificate. What a board hears and is sent is still plain HTTP
+on your LAN, and anyone with the board in hand (USB) can read its keys: there is no flash
+encryption. Keep boards on a network you trust.
+
 ## License
+
+The release `.bin` files also hold LVGL (MIT), TensorFlow Lite Micro (Apache 2.0), cJSON (MIT),
+ESP-IDF (Apache 2.0) and, in ai-speaker-mic's image, Espressif's esp-sr models (under the exception
+in LICENSE); their notices are in each component's source.
 
 The screens draw with Montserrat, compiled into LVGL's own component under
 the SIL Open Font License 1.1 (see its `COPYRIGHTS.md`); a font regenerated

@@ -142,11 +142,11 @@ def cmd_status(port):
 def cmd_flash(port, skip_backup=False):
     args = BUILD / 'flasher_args.json'
     if not args.exists():
-        sys.exit("No build found. Run: bash build.sh ai-speaker-mic (in the firmware folder)")
+        sys.exit("No build found. Run: bash build.sh tdongle (in the firmware folder)")
     plan = json.loads(args.read_text())
     CACHE.mkdir(parents=True, exist_ok=True)
-    if not skip_backup and not list(CACHE.glob('factory-waveshare-audio-*.bin')):
-        backup = CACHE / time.strftime('factory-waveshare-audio-%Y%m%d-%H%M%S.bin')
+    if not skip_backup and not list(CACHE.glob('factory-tdongle-*.bin')):
+        backup = CACHE / time.strftime('factory-tdongle-%Y%m%d-%H%M%S.bin')
         print(f"Saving what is on the board now to {backup.relative_to(ROOT)} (about two minutes) ...")
         r = esptool('--port', port, '--chip', 'esp32s3', '--baud', '460800', '--after', 'watchdog-reset',
                     'read-flash', '0', hex(FLASH_BYTES), str(backup))

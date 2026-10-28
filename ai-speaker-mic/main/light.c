@@ -15,6 +15,7 @@
 #include "nvs.h"
 
 #include "board.h"
+#include "capture.h"
 #include "settings.h"
 #include "wake.h"
 
@@ -146,6 +147,8 @@ static const look_t *showing(void)
     if (!strcmp(cue, "speaking")) return &looks[LOOK_SPEAKING];
     if (!strcmp(cue, "error")) { plain = (look_t){255, 0, 0, false, PAT_BLINK, 150, 0, 0.4f, true}; return &plain; }
     if (!strcmp(cue, "camera")) { plain = (look_t){255, 255, 255, false, PAT_BLINK, 150, 0, 0.5f, true}; return &plain; }   // a picture is about to be taken
+    // The room going to Sapphire (POST /capture, up to a day) says so, as listen and the camera do (scouts, 2026-10-28)
+    if (capture_active()) { plain = (look_t){255, 0, 60, false, PAT_PULSE, 20, 0.05f, 0.35f, true}; return &plain; }
     if (!strcmp(cue, "nolink") && light_in_hours()) return &looks[LOOK_NOLINK];
     if (backing) { plain = (look_t){255, 100, 0, false, PAT_PULSE, 30, 0.0f, 0.15f, true}; return &plain; }   // orange, soft: it lands at night
     if (held_until_us) {
@@ -157,9 +160,9 @@ static const look_t *showing(void)
 }
 
 // Turned off, the ring is dark through every state: only the camera's warning
-// shows, because the room is owed it. The look is still worked out, so the
+// and a capture show, because the room is owed them. The look is still worked out, so the
 // glass's middle goes on saying when she listens.
-static bool hidden(void) { return dark && strcmp(cue, "camera"); }
+static bool hidden(void) { return dark && strcmp(cue, "camera") && !capture_active(); }
 
 static void light_task(void *arg)
 {

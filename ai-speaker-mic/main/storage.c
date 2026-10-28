@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -510,8 +511,9 @@ static void close_free(storage_write_t *w, bool ok)
     xSemaphoreGive(busy);
 }
 
-bool storage_write_finish(storage_write_t *w, char sha_hex[65], uint64_t *size)
+bool storage_write_finish(storage_write_t *w, const char *want, char sha_hex[65], uint64_t *size, bool *mismatch)
 {
+    *mismatch = false;
     bool flushed = flush(w);                              // a short write says so itself
     errno = 0;
     bool ok = flushed && w->got == w->expect && !fflush(w->f) && !fsync(fileno(w->f));
@@ -523,6 +525,8 @@ bool storage_write_finish(storage_write_t *w, char sha_hex[65], uint64_t *size)
     for (int i = 0; i < 32; i++) sprintf(sha_hex + 2 * i, "%02x", digest[i]);
     fclose(w->f);
     w->f = NULL;
+    // before the rename: a bad copy dropped after it had already replaced the good one of that name (scouts, 2026-10-28)
+    if (ok && want && want[0] && strcasecmp(want, sha_hex)) { ok = false; *mismatch = true; snprintf(last_error, sizeof last_error, "sha256 mismatch"); }
     char final[sizeof w->part];
     snprintf(final, sizeof final, FOLDER "/%s", w->name);
 #ifdef BOARD_STORAGE_CHECKS
@@ -550,6 +554,23 @@ void storage_write_drop(storage_write_t *w)
     if (w->f) { fclose(w->f); w->f = NULL; }
     unlink(w->part);
     close_free(w, false);
+}
+
+// A restore is read on the store task: a remount from storage_alive on the server's task
+// freed FATFS under its f_read (scouts, 2026-10-28). The reader holds the card as a writer does.
+FILE *storage_read_open(const char *name)
+{
+    char path[sizeof FOLDER + 300];
+    if (!mounted || !storage_path(name, path, sizeof path) || !take_busy()) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) xSemaphoreGive(busy);
+    return f;
+}
+
+void storage_read_close(FILE *f)
+{
+    fclose(f);
+    xSemaphoreGive(busy);
 }
 
 bool storage_remove(const char *name)

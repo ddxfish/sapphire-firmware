@@ -164,7 +164,7 @@ static void cmd_screen(const char *rest)
     else if (!strcmp(what, "bright")) settings.brightness = value < 0 ? 0 : value > 100 ? 100 : value;
     else { answer_text("{\"error\": \"screen invert|flip 0|1, or screen bright 0..100\"}"); return; }
     settings_save();
-    board_glass_orient(settings.invert, settings.flip);
+    ui_orient();
     board_backlight(settings.brightness);
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "invert", settings.invert);

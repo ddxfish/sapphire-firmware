@@ -88,8 +88,9 @@ static void restart_soon(void *arg)
     esp_restart();
 }
 
-void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
+bool ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
 {
+    bool installed = false;
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
     esp_ota_handle_t ota = 0;
     uint8_t *buf = NULL;
@@ -138,6 +139,14 @@ void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
         refuse(req, 422, "sha256 mismatch: not installed");
         goto done;
     }
+    // whose program it is, read back from the slot: the check on the first piece is skipped
+    // when that piece arrives short, and another board's program then ran and was kept
+    esp_app_desc_t desc;
+    if (esp_ota_get_partition_description(next, &desc) != ESP_OK
+        || strncmp(desc.project_name, esp_app_get_description()->project_name, sizeof desc.project_name)) {
+        refuse(req, 422, "a program for another kind of board");
+        goto done;
+    }
     if (esp_ota_set_boot_partition(next) != ESP_OK) { refuse(req, 507, "could not mark the new program to boot"); goto done; }
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject(j, "ok", true);
@@ -147,6 +156,8 @@ void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
     answer(req, 200, j);
     ESP_LOGI(TAG, "new program in slot %s (%u bytes): restarting onto it", next->label, (unsigned)req->content_len);
     xTaskCreate(restart_soon, "ota-restart", 3072, NULL, 5, NULL);
+    installed = true;
 done:
     httpd_req_async_handler_complete(req);
+    return installed;
 }

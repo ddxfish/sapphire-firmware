@@ -9,4 +9,4 @@ void ota_start(void);                  // at boot: a program on trial is kept af
 void ota_fine(void);                   // this program works (WiFi joined): keep it, no rollback
 bool ota_can(void);                    // two program slots on this board
 const char *ota_slot(void);            // the slot running now: "ota_0"
-void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void));   // PUT /firmware, on an async-handed request
+bool ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void));   // PUT /firmware, on an async-handed request; true: installed, restarting

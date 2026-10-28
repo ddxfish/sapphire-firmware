@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -128,6 +129,14 @@ void ota_put(httpd_req_t *req, int pace_ms, void (*yield)(void))
     char want[72] = {0};
     if (httpd_req_get_hdr_value_str(req, "X-Sha256", want, sizeof want) == ESP_OK && want[0] && strcasecmp(want, hex)) {
         refuse(req, 422, "sha256 mismatch: not installed");
+        goto done;
+    }
+    // whose program it is, read back from the slot: the check on the first piece is skipped
+    // when that piece arrives short, and another board's program then ran and was kept
+    esp_app_desc_t desc;
+    if (esp_ota_get_partition_description(next, &desc) != ESP_OK
+        || strncmp(desc.project_name, esp_app_get_description()->project_name, sizeof desc.project_name)) {
+        refuse(req, 422, "a program for another kind of board");
         goto done;
     }
     if (esp_ota_set_boot_partition(next) != ESP_OK) { refuse(req, 507, "could not mark the new program to boot"); goto done; }

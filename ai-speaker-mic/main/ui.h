@@ -72,4 +72,5 @@ void ui_test_card(void);                          // frame, TOP, color bars, a t
 int ui_beat_age_ms(void);                         // since LVGL's task last ran its tick; -1 without a glass
 int ui_doors_shut(void);                          // calls that gave up on the lock since boot
 void ui_test_stuck(void);                         // console `fault glass`: holds the lock for good
+bool ui_orient(void);                             // settings.invert and settings.flip to the panel, under LVGL's lock
 bool ui_relight(void);                            // the brightness settings changed: apply them now

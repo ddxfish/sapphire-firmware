@@ -41,8 +41,8 @@ speaker amplifier on the DAC pin, a TF slot, the BOOT button.
 
 ## Set up a board
 
-**From the browser** (Chrome or Edge): Settings > Devices > + Add Device >
-New board (USB). Plug the board in, Connect, Install, then a name and the
+**From the browser** (Chrome or Edge): Settings > Devices > + Add Satellite >
+Dev board. Plug the board in, Connect, Install, then a name and the
 WiFi. Sapphire mints the keys and learns the board's address when it calls in.
 
 **From a terminal**: needs `esptool` and `pyserial`
@@ -64,7 +64,7 @@ WiFi. Sapphire mints the keys and learns the board's address when it calls in.
    Screen tab too, and a save there is what the board keeps.
 4. `python setup_board.py setup` - in your own terminal. WiFi, Sapphire's
    address, her certificate, the two keys.
-5. Settings > Devices > + Add Device > Satellite. Paste the address and the
+5. Settings > Devices > + Add Satellite. Paste the address and the
    keys. Press Test now.
 
 Then type on it.

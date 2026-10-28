@@ -8,10 +8,10 @@ Settings > Devices as a **Satellite**, like a Raspberry Pi body.
 First board: the Waveshare ESP32-S3-AUDIO-Board (two mics, a speaker, a ring
 of 7 lights, 8 MB PSRAM, 16 MB flash).
 
-| Version 0.3 does | Not yet |
+| Version 0.9 does | Not yet |
 |---|---|
-| Wake word, then a question to Sapphire | The ring as a light she can set |
-| Her answer through the speaker | The touch top |
+| Wake word, then a question to Sapphire | A battery reading |
+| Her answer through the speaker | Her own wake word: the open "hey jarvis" listens until "hey sapphire" is trained |
 | `listen` on demand | |
 | Restart and sleep from Sapphire | |
 | Backups on the SD card (0.2.0) | |
@@ -26,8 +26,8 @@ of 7 lights, 8 MB PSRAM, 16 MB flash).
 
 ## Set up a board
 
-**From the browser** (Chrome or Edge): Settings > Devices > + Add Device >
-New board (USB). Plug the board in, Connect, Install, then a name and the
+**From the browser** (Chrome or Edge): Settings > Devices > + Add Satellite >
+Dev board. Plug the board in, Connect, Install, then a name and the
 WiFi (`scan` lists what the board can see, 0.2.3). Sapphire mints the keys
 and learns the board's address when it calls in.
 
@@ -45,7 +45,7 @@ Needs `esptool` and `pyserial` (`pip install esptool pyserial`).
    and Sapphire's address, fetches her certificate so the board trusts that
    one only, makes the two keys, and prints them. `python setup_board.py keys`
    shows them again.
-5. Settings > Devices > + Add Device > Satellite. Paste the address and the keys.
+5. Settings > Devices > + Add Satellite. Paste the address and the keys.
 
 After that the board only needs power.
 
@@ -104,6 +104,7 @@ meanwhile, the write runs on its own task.
 | 0.7.7 | Her voice from PSRAM: `/audio/speak` takes the whole sentence into PSRAM at WiFi speed and answers at once, a player task plays it from there (a WiFi stall can delay a sentence's start, never make a hole in it; it played straight off the socket with ~0.4 s of slack). A stop drops what was queued (`stop_gen`); up to 1.5 MB waits (~47 s); past it a speak holds its answer until there is room (a stop answers it `stopped`). A stop counts first, then cuts (no sentence slips past it), a sentence still arriving counts as talking, and a tap that cuts an announcement tells Sapphire (`ask stop`). `/audio/listen` waits (up to 10 s) until she is done talking, on its own task. Her speaker chips are read back before every sentence and set up again if one reset (`sound.heals`, `heal_last`; the expander's driver only remembers what it wrote, 2026-10-19). `/health` `sound`: `queued_kb` and `late_*`, a sentence that took longer to play than it is long. Pictures: the last one stays on the glass until the next is whole (no flash between two); `/screen/picture?format=jpeg` takes one JPEG (w and h multiples of 16, `esp_new_jpeg`), says `screen.jpeg` in `/health` and `took_ms` in its answer, and is painted straight to the panel in 16-line strips (LVGL's PSRAM path cost ~3 us a pixel). Her face at 240x240 is ~8 a second; the toast and cards are drawn again over each frame, a tap hides the face for the rest of her reply, and one bad frame keeps the one before. `/health` `free_internal_min_kb` |
 | 0.7.8 | A stream on the glass, generic (nothing in the firmware knows a face): JPEG frames sent one after another decode as they land and are painted on a beat, `screen.fps` in `/health` (3), the newest decoded frame each beat, so frames that arrive unevenly reach the glass evenly; a frame landing while one still waits replaces it (`replaced` in its answer, `screen.stream` counts). The first frame of a stream paints at once. A card write that fails says why: `storage.last_error` in `/health` and the card's own errno in the 507; a failed pre-allocation reopens the file instead of leaving FatFs' handle in error |
 | 0.9.3 | The glass game hunt: a long press to leave a game while a frame was still decoding freed the memory the decoder was writing into (the picture's end now leaves a landing frame its memory and the frame is dropped when whole, answered `hidden`); a hold's "left" answer is consumed by the game's own next frame and cleared by a clear, never left armed for the next game's first frame; the chat picker closes when a picture lands or the glass goes dark and wakes the glass when it opens (left open under a stream it stayed on top for taps, unseen); her refusal of the chats door is toasted in her words |
+| 0.9.4 | The release hunt: requests signed with the key, the key never on the network (auth.c, Bearer still read for an older Sapphire); a refused request with a big body closes its socket instead of being drained (a keyless PUT made the board deaf); one owner for the wake word's state (a standdown could land on a question already sending: two answers); the screen's flip under LVGL's lock; a program, a backup and a restart never cut each other; a backup that fails its sha256 keeps the one before it; a restore holds the card against a remount; the ring pulses magenta while the room goes to Sapphire, even turned off; cJSON in PSRAM; WiFi retries off the event loop; a 64-digit PSK joins; a program for another board is refused from the slot itself |
 | 0.9.2 | The chat picker's rows for a finger: 20 px names on 46 px rows, four at a time, the list centred over the glass and never wider than it |
 | 0.9.1 | The chat picker: a tap on the bottom place (the chat's name) asks Sapphire which chats this board may talk in (`GET /api/devices/<name>/chats`, the reader's door) and drops the list UP from the name, six at a time, the one it talks in marked; a tap on a name is the pick (`POST .../chat {"name"}`), kept on her side as the board's *Talks in chat*, and the name comes back through `POST /screen {"chat"}`; a tap beside the list closes it. With *Browse chats* off for the board in Settings > Devices (the default) the list is the one chat it talks in, and a pick of another is refused with a toast. A `chats` job, the bottom place's own; Settings > Devices may put it on any button. `picker` joins `has`, which is what makes the Devices page show *Browse chats* for this board |
 | 0.9.0 | Seven places to touch, one style, tiling the glass with no gap: the four corners (72 wide, half the glass tall; the round button stays drawn in the corner), top and bottom (176x72) and the middle (176x96). All seven are buttons by name (`top`, `bottom`, `middle` join the corners in `BUTTONS`; `BUTTONS_MAX` 12), so Settings > Devices may set any of them; left alone the top opens the status page (a `status` job), the middle listens or stops her (`listen`), the bottom does nothing. One table (`ZONES`) draws them, names the one under a finger and is said in `/health` as `screen.zones`, with `screen.taps: true`. A stream may ask for the taps: frames sent `?format=jpeg&taps=1` make every tap on the stream a raw press of its place (`POST .../press` by name, `link_tap`, no cue on the ring, nothing dismissed), for a game Sapphire runs on the glass; a finger held anywhere on such a stream leaves it (the board's own page is back as after a tap-away, and the stream's next frame is answered `hidden`, which its sender reads as "the player left"). A hold is 1.2 s on the glass (`HOLD_MS`; LVGL's 400 ms made a firm press on a game's DEAL leave the game), for a corner's dial too. A stream that did not ask behaves as before |

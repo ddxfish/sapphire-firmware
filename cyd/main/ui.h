@@ -77,4 +77,5 @@ void ui_history_fail(void);
 // holds it (server.c). LVGL is held still meanwhile; what she says in that
 // time is kept and drawn when the picture goes.
 bool ui_picture_begin(void);               // false: the screen is busy
+void ui_picture_hold(void);                // painted: LVGL stays stopped, its lock is free for others
 void ui_picture_end(void);
