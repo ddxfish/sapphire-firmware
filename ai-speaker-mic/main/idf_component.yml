@@ -15,7 +15,8 @@ dependencies:
   lvgl/lvgl: "^9.3"
   espressif/esp_lvgl_port: "^2.6"
   espressif/esp_lcd_touch_cst816s: "^1.1"
-  # the eye (0.5.0): the DVP camera driver, JPEG straight from the sensor, autodetects OV2640/OV3660/OV5640
-  espressif/esp32-camera: "^2.1.8"
+  # the eye (0.5.0): the DVP camera driver (esp32-camera 2.1.8) is NOT from the registry since 0.9.5: our
+  # copy in components/esp32-camera, patched (driver/cam_hal.c, "Sapphire patch"): its frame buffer owns
+  # the cache lines the driver invalidates, which corrupted the heap 1 shot in ~20 and crashed the board
   # a picture as JPEG (0.7.7): the S3's SIMD decoder, already here through esp-dl, named so it stays
   espressif/esp_new_jpeg: "~1.0.2"

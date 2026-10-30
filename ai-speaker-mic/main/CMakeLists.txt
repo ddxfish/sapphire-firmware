@@ -5,7 +5,8 @@ idf_component_register(
     EMBED_FILES ../models/hey_jarvis.tflite
     REQUIRES app_update nvs_flash esp_wifi esp_netif esp_event esp_http_server esp_http_client esp-tls
              esp_driver_i2c esp_driver_i2s esp_driver_usb_serial_jtag esp_timer json vfs spiffs esp_adc
-             fatfs sdmmc esp_driver_sdmmc mbedtls esp_lcd esp_driver_spi esp_driver_ledc esp_driver_gpio espcoredump)
+             fatfs sdmmc esp_driver_sdmmc mbedtls esp_lcd esp_driver_spi esp_driver_ledc esp_driver_gpio espcoredump
+             esp32-camera)                       # our patched copy in components/ (0.9.5)
 target_compile_definitions(${COMPONENT_LIB} PRIVATE TF_LITE_STATIC_MEMORY TF_LITE_DISABLE_X86_NEON ESP_NN
                            PROJECT_VER="${PROJECT_VER}" FIRMWARE_MODEL="ai-speaker-mic")
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)

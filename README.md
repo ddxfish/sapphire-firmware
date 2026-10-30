@@ -9,7 +9,7 @@ so Sapphire shows only what a board says it has.
 
 | Device | Image | Features | Notes |
 |---|---|---|---|
-| **AI speaker and mic**<br>Waveshare ESP32-S3-AUDIO-Board<br>`ai-speaker-mic/` · 0.9.4 | | • Wake word<br>• Mic<br>• Speaker<br>• Light ring<br>• Screen (optional)<br>• Touch (optional)<br>• Camera (optional)<br>• Chat picker<br>• Buttons<br>• Backups<br>• Updates over WiFi | A voice box: say the wake word, ask, hear her answer. The screen is Waveshare's 2" touch LCD; the camera is any OV2640/OV3660/OV5640. |
+| **AI speaker and mic**<br>Waveshare ESP32-S3-AUDIO-Board<br>`ai-speaker-mic/` · 0.9.5 | | • Wake word<br>• Mic<br>• Speaker<br>• Light ring<br>• Screen (optional)<br>• Touch (optional)<br>• Camera (optional)<br>• Chat picker<br>• Buttons<br>• Backups<br>• Updates over WiFi | A voice box: say the wake word, ask, hear her answer. The screen is Waveshare's 2" touch LCD; the camera is any OV2640/OV3660/OV5640. |
 | **CYD 2.8" reader**<br>ESP32-2432S028R<br>`cyd/` (`cyd28`) · 0.5.2 | | • Screen<br>• Touch (resistive)<br>• Keyboard<br>• Chat picker<br>• Speaker<br>• LED<br>• Light sensor<br>• Buttons<br>• Backups<br>• Updates over WiFi | A chat in your pocket, a page at a time. Speaker needs an 8 Ω speaker on its JST 1.25 mm plug. |
 | **CYD 3.5" reader**<br>ESP32-3248S035C<br>`cyd/` (`cyd35`) · 0.5.2 | | • Screen<br>• Touch (capacitive)<br>• Keyboard<br>• Chat picker<br>• Speaker<br>• LED<br>• Light sensor<br>• Buttons<br>• Backups<br>• Updates over WiFi | Same program as the 2.8", bigger glass. Builds; not yet proven on a board. |
 | **Backup stick**<br>LilyGO T-Dongle-S3<br>`tdongle/` · 0.1.4 | | • Backups<br>• Screen<br>• LED<br>• Buttons<br>• Updates over WiFi | Plug into any USB power. Every backup is read back and checked at each start. |
@@ -122,6 +122,8 @@ Not ours, and under their own terms:
   LVGL, TensorFlow Lite Micro and others): Apache 2.0 or MIT, each with its
   license in its folder. Two of Espressif's, `esp-sr` and `esp_new_jpeg`, are
   under the "Espressif MIT" license, which allows them on Espressif chips only.
+- `ai-speaker-mic/components/esp32-camera/`: Espressif's esp32-camera 2.1.8, Apache License 2.0
+  (its `LICENSE`), with one change of ours in `driver/cam_hal.c` marked "Sapphire patch".
 
 Additional permission under section 7 of the GNU AGPL v3: you may combine
 this code with Espressif's `esp-sr` and `esp_new_jpeg` components and convey

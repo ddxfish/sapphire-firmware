@@ -18,10 +18,13 @@
 #include "light.h"
 
 static const char *TAG = "camera";
-#define XCLK_HZ 20000000
+#define XCLK_HZ 10000000               // 20 MHz coupled into the shared I2C: a camera start failed 1 in 4
+                                       // (register writes refused), 10 MHz 1 in 20 and plenty for SVGA JPEG
 #define JPEG_QUALITY 12                // 0 best .. 63; 12 = good and a 800x600 frame of 40-70 KB
 #define SETTLE_FRAMES 3                // the exposure finds the room over a few frames
 #define WARN_MS 700                    // the ring blinks and two notes sound before the shot
+#define TRIES 3                        // the shared bus still loses a register write now and then:
+#define RETRY_MS 100                   // powered down and started again
 
 static bool present, busy;
 static char sensor_name[16];
@@ -105,6 +108,31 @@ cJSON *camera_sizes(void)
     return a;
 }
 
+// One try: up, the exposure settles, one frame copied out, down.
+static bool shoot(int pick, snap_t *out, char *why, size_t why_len)
+{
+    if (!up(SIZES[pick].size, why, why_len)) return false;
+    bool ok = false;
+    camera_fb_t *fb;
+    for (int n = 0; n < SETTLE_FRAMES; n++) {
+        fb = esp_camera_fb_get();
+        if (!fb) break;                           // a stream that gives nothing now gives nothing: the next try, not 4 s more each
+        esp_camera_fb_return(fb);
+    }
+    fb = fb ? esp_camera_fb_get() : NULL;
+    if (fb && fb->len > 4) {
+        out->jpeg = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
+        if (out->jpeg) {
+            memcpy(out->jpeg, fb->buf, fb->len);
+            out->len = fb->len; out->w = fb->width; out->h = fb->height;
+            ok = true;
+        } else strlcpy(why, "no memory for the picture", why_len);
+    } else strlcpy(why, "the camera gave no frame", why_len);
+    if (fb) esp_camera_fb_return(fb);
+    down();
+    return ok;
+}
+
 bool camera_snap(int w, int h, snap_t *out, char *why, size_t why_len)
 {
     memset(out, 0, sizeof *out);
@@ -120,23 +148,12 @@ bool camera_snap(int w, int h, snap_t *out, char *why, size_t why_len)
     audio_tone(1320, 160);
     vTaskDelay(pdMS_TO_TICKS(WARN_MS));
     bool ok = false;
-    if (up(SIZES[pick].size, why, why_len)) {
-        camera_fb_t *fb;
-        for (int n = 0; n < SETTLE_FRAMES; n++) {
-            fb = esp_camera_fb_get();
-            if (fb) esp_camera_fb_return(fb);
+    for (int n = 0; n < TRIES && !ok; n++) {
+        if (n) {
+            ESP_LOGW(TAG, "try %d of %d: %s", n + 1, TRIES, why);
+            vTaskDelay(pdMS_TO_TICKS(RETRY_MS));
         }
-        fb = esp_camera_fb_get();
-        if (fb && fb->len > 4) {
-            out->jpeg = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
-            if (out->jpeg) {
-                memcpy(out->jpeg, fb->buf, fb->len);
-                out->len = fb->len; out->w = fb->width; out->h = fb->height;
-                ok = true;
-            } else strlcpy(why, "no memory for the picture", why_len);
-        } else strlcpy(why, "the camera gave no frame", why_len);
-        if (fb) esp_camera_fb_return(fb);
-        down();
+        ok = shoot(pick, out, why, why_len);
     }
     light_camera_done();                            // back to the brain's cue, or idle
     busy = false;
