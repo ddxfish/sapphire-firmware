@@ -124,6 +124,7 @@ Not ours, and under their own terms:
   under the "Espressif MIT" license, which allows them on Espressif chips only.
 - `ai-speaker-mic/components/esp32-camera/`: Espressif's esp32-camera 2.1.8, Apache License 2.0
   (its `LICENSE`), with one change of ours in `driver/cam_hal.c` marked "Sapphire patch".
+  Its OpenMV sensor and SCCB drivers are MIT (`LICENSE-OpenMV` in that folder).
 
 Additional permission under section 7 of the GNU AGPL v3: you may combine
 this code with Espressif's `esp-sr` and `esp_new_jpeg` components and convey
