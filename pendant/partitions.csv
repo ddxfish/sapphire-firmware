@@ -1,0 +1,12 @@
+# Name,     Type, SubType, Offset,  Size,  Flags
+# Two program slots (ota_0/ota_1) and the ledger that says which boots
+# (otadata): her program arrives over the air (ota.c). 16 MB chip.
+nvs,        data, nvs,     0x9000,  0x6000,
+otadata,    data, ota,     0xf000,  0x2000,
+phy_init,   data, phy,     0x11000, 0x1000,
+ota_0,      app,  ota_0,   0x20000, 4M,
+ota_1,      app,  ota_1,   ,        4M,
+model,      data, spiffs,  ,        3M,
+wake,       data, spiffs,  ,        2M,
+# a crash writes itself here; the next boot sums it up for /health (lastwords.c, 0.5.2)
+coredump,   data, coredump,,        256K,

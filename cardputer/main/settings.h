@@ -14,7 +14,7 @@ typedef struct {
     char wifi_password[SETTING_MAX];
     char key[SETTING_MAX];             // the key Sapphire sends
     char voice_key[SETTING_MAX];       // the key this board sends
-    char sapphire[SETTING_MAX];        // https://192.168.0.10:8073
+    char sapphire[SETTING_MAX];        // https://192.0.2.10:8073
     char cert[CERT_MAX];               // Sapphire's certificate, or empty = not checked
     int volume;                        // the speaker, 0 to 100
     int mic_gain_x2;                   // the microphones, in half decibels: 0..75 = 0..37.5 dB (the ES7210's range)

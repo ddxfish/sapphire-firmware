@@ -57,8 +57,11 @@ dist/index.json                 every board here: version, chip, sha256, what si
 dist/cyd28-0.5.2.bin            the whole board: bootloader, partition table, program
 ```
 
-To flash your own build from Sapphire, set **DEVICE_FIRMWARE_SOURCE** in her
-settings to the `dist` folder. Each board's `setup_board.py` flashes and sets
+To flash your own build from Sapphire, add the `dist` folder as a source: in
+**System > Devices**, the **Settings** tab, **Board firmware sources**, paste its
+path and click **+ Board Repo**. Your sources are read before Sapphire's own
+release, so a board both have comes from yours; each has an on/off switch
+(settings `DEVICE_FIRMWARE_SOURCES` and `DEVICE_FIRMWARE_SOURCES_OFF`). Each board's `setup_board.py` flashes and sets
 up from a terminal instead.
 
 ## A release
