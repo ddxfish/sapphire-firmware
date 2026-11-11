@@ -289,6 +289,29 @@ static void touch_reset_pulse(void)
     vTaskDelay(pdMS_TO_TICKS(60));                  // the CST816 wants ~50 ms after reset before it answers
 }
 
+static bool i2c_up(void)
+{
+    if (i2c) return true;
+    i2c_master_bus_config_t bus = {.i2c_port = 0, .sda_io_num = BOARD_I2C_SDA, .scl_io_num = BOARD_I2C_SCL,
+                                   .clk_source = I2C_CLK_SRC_DEFAULT, .flags.enable_internal_pullup = true};
+    bus_clear(bus.sda_io_num, bus.scl_io_num);
+    return i2c_new_master_bus(&bus, &i2c) == ESP_OK;
+}
+
+// Before board_init, from power.c at a dead-battery boot. The expander is not reset with the chip,
+// so the rail and the amplifier are as the last life left them: on. This boot is going to deep-sleep
+// instead of booting, and they go off first: the bus, the device, every pin an output, every output
+// off. One tick from the speaker as the amplifier loses power; the loop this replaces ticked twice
+// a lap. No lock: nothing else is up yet.
+bool board_dark(void)
+{
+    if (!i2c_up()) return false;
+    i2c_device_config_t dev = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = AW_ADDR, .scl_speed_hz = BOARD_I2C_HZ};
+    if (!aw && i2c_master_bus_add_device(i2c, &dev, &aw) != ESP_OK) { aw = NULL; return false; }
+    out1 = (uint8_t)((out1 & ~P1_PWR_EN) | P1_AMP_OFF);
+    return aw_write(AW_REG_CFG0, 0x00) && aw_write(AW_REG_CFG1, 0x00) && aw_write(AW_REG_OUT0, 0x00) && aw_write(AW_REG_OUT1, out1);
+}
+
 bool board_init(int rate)
 {
     gpio_config_t pins = {.pin_bit_mask = 1ULL << BOARD_TP_RST, .mode = GPIO_MODE_OUTPUT};
@@ -296,10 +319,7 @@ bool board_init(int rate)
     gpio_set_level(BOARD_TP_RST, 0);
     gpio_config_t key = {.pin_bit_mask = 1ULL << BOARD_BOOT_BUTTON | 1ULL << BOARD_TP_INT, .mode = GPIO_MODE_INPUT, .pull_up_en = 1};
     gpio_config(&key);
-    i2c_master_bus_config_t bus = {.i2c_port = 0, .sda_io_num = BOARD_I2C_SDA, .scl_io_num = BOARD_I2C_SCL,
-                                   .clk_source = I2C_CLK_SRC_DEFAULT, .flags.enable_internal_pullup = true};
-    bus_clear(bus.sda_io_num, bus.scl_io_num);
-    if (i2c_new_master_bus(&bus, &i2c) != ESP_OK) { ESP_LOGE(TAG, "%s", trouble = "the I2C bus did not start"); return false; }
+    if (!i2c_up()) { ESP_LOGE(TAG, "%s", trouble = "the I2C bus did not start"); return false; }
     bool have = false;
     for (int n = 0; n < 3 && !(have = expander_init()); n++) {
         ESP_LOGW(TAG, "the AW9523 did not answer (try %d)", n + 1);

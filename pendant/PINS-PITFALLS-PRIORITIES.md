@@ -260,3 +260,75 @@ finds the last boot's ring at the same address and serves it at `GET /log?last=1
 first time for a reason worth keeping: the heap writes its free-list pointers into the first eight
 bytes of the pool's first block at every boot, exactly where the magic was. The magic now sits past
 a sixteen-byte guard. Proven across a plain restart; the reset button is next.
+
+Eighth postscript, the dark wake and the trail. The reset button came, twice. A board that had
+slept forty-three hours on 0.5.2 did nothing at all under BOOT: no glass, no light, no word on
+the network. RESET brought it back as "power on", and the ring was there, magic and head intact,
+and rotted: the PSRAM has no refresh while EN is held, so whole rows came back blank and the rest
+came back with bits flipped, every third byte wrong. Enough survived to read the sleep's own
+beginning and the WiFi going down after it, and nothing stamped later. No core dump, so no panic.
+That is the whole account the board could give of a day and a half, and it is not enough.
+
+Two things follow. The loop around `esp_light_sleep_start` trusted the call: a rejected sleep
+(a wake already pending at entry) returns without setting the wake cause, so the old loop went
+straight round, awake, dark, silent, and the one thing that would have ended it, a BOOT press,
+is itself what rejects a sleep. 0.5.3 counts a rejection, reads BOOT as the wake, waits before
+trying again. And evidence has to live where a reset cannot reach. RTC slow memory keeps its
+bytes through EN as long as the board has power; what it lacks is a way to know they are real,
+which is a CRC, the same way the bootloader keeps its own `rtc_retain_mem`. The sleep trail is
+that: how many sleeps, how far the last one got (asleep, woke, rail, glass, ui, sound, radio,
+done), how many heartbeats it counted (a timer wake every half hour that does nothing but count
+and sleep on), how many sleeps were rejected, what woke it. `/health` shows it as `sleep`, with
+`before_reset` for what the boot found. The next dark board can be RESET without regret: the
+trail will say whether the chip was alive and counting, or stopped, and at which step. The
+serial console remains the direct witness, and the board is going on the bench for it.
+
+Ninth postscript, the wake that came. The first long sleep on 0.5.3 ran ten and a half hours
+and ended on one BOOT press: twenty-one heartbeats, twenty-two light sleeps, none rejected,
+every step through "done", the uptime unbroken. That is not the twenty-four-hour mark both dark
+wakes were past, and the heartbeat changes the experiment (the chip never sleeps more than
+half an hour at a stretch now), so it is evidence, not proof; the day-long run follows. What the
+wake's own log did prove was a smaller thing: the rail powers the card, the card forgets its
+initialization without power, and the host still held it mounted, so the first read after the
+wake timed out. The upload doors ask the card first and would have remounted it; the health
+report and the storage page only asked "mounted". 0.5.4 unmounts before the rail goes and
+mounts again after the radio, a "card" step in the trail. And sleep is now something a person
+turns on: the default is never. A board that cannot sleep cannot fail to wake, and until the
+day-long run is in, that is the honest default for a board with no switch.
+
+Tenth postscript, the dead battery. A board with no switch is never off, and a cell that has
+run down does the worst thing a supply can do: it carries the chip until the first real load,
+sags under the brownout level (2.44 V at level 7 on this chip, not the 2.51 V I had said),
+the chip resets itself, the unloaded cell recovers a few tenths of a volt in seconds, and the
+board boots again, and again, the speaker ticking each lap as the amplifier's FET switches.
+Krem watched a different board do it. A cell with a protection board ends this by cutting
+itself off; a bare cell is over-discharged by it within a day or two. The board cannot tell
+which it has: no sense line, no USB-present pin. What it can count is the brownouts, because
+the brownout handler ends in a software reset and RTC memory reads through one. 0.5.5 stamps
+the trail with this boot's age every second and, at a brownout boot, reads how long the life
+before it lasted. Two brownouts in a row, the second within two minutes, and the boot does not
+try: it writes the expander dark (the expander is not reset with the chip, so the rail and the
+amplifier were still on) and deep-sleeps on a timer alone, one minute, then two, four, up to
+thirty. The timer wake is a reset, which a boot from a brownout was anyway, and it never asks
+GPIO 0 anything, so the strap trap that keeps the user wake on light sleep does not apply.
+Each try runs with the amplifier held off, nothing ticks, and two minutes without a brownout
+is the whole proof: the count clears and the sound comes on. RESET, or a replug, is "try
+now". The same honesty fixed the shutdown: deep sleep with no wake source at all, RESET or a
+power cycle to return, rather than the GPIO 0 wake it had, which was the trap itself with the
+rail left on. None of this has met a dying cell yet; the board is asleep on its day-long run
+and 0.5.5 waits in dist. The one thing the guard cannot see is a cell that falls far enough
+for a power-on reset instead of a brownout: the trail is fresh at every lap then, and only a
+protected cell helps.
+
+Eleventh postscript, the day that came. The long run on 0.5.4 slept twenty-five and a half
+hours, past the mark both dark wakes were lost at, and ended on one BOOT press: fifty
+heartbeats, fifty-one light sleeps, none rejected, every step through "done", the card mounted
+on the first try after the radio, the uptime unbroken. The dark wake has not come back since
+0.5.3. What I cannot say is which of 0.5.3's three changes ended it. The heartbeat, the
+reject-safe loop and the trail shipped together, and the heartbeat alone changes the question:
+a chip that never sleeps more than half an hour at a stretch would route around a fault that
+lives in one long sleep without ever meeting it. Separating them is a day-long run with the
+heartbeat off, and I judged the day not worth it; a sleeping device that checks in on itself
+every half hour is the right shape whatever the fault was. So: closed on this build, cause not
+named. 0.5.5 went on the board at six minutes past midnight, the trail read fresh once for
+its new shape, no doubt, no brownouts; the dead-battery guard still waits for a dying cell.

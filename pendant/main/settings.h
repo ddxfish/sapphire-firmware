@@ -60,7 +60,7 @@ typedef struct {
 #define RING_LEAST 5                     // the slider's floor: a ring at 0 is what "off" is for
 #define MIC_GAIN_X2_DEFAULT 24           // 12 dB, digital: a PDM mic has no analog gain, and 30 dB clipped
 #define MIC_GAIN_X2_MAX 60
-#define SLEEP_AFTER_MIN_DEFAULT 60       // an hour (Krem 2026-11-02): room for a backup and a chat; 10 slept the board the moment a backup landed
+#define SLEEP_AFTER_MIN_DEFAULT 0        // never (Krem 2026-11-08): a board that never sleeps never fails to wake; sleep is opt-in. Was an hour (2026-11-02); 10 slept the board the moment a backup landed
 #define AEC_DELAY_MS_DEFAULT 0           // the sweep of 2026-11-02 on her voice: 0 ms cut the echo 34x, 16 ms 11x, 64 ms barely; the filter spans the 26-36 ms the sound takes to come back
 #define AEC_FILTER_DEFAULT 4
 #define TOUCH_DY_DEFAULT 10

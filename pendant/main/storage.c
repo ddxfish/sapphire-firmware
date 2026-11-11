@@ -402,6 +402,21 @@ bool storage_alive(void)
     return true;
 }
 
+// Asleep, the rail takes the card's power with it (board.h), and a card that lost power
+// forgets its initialization while the host still holds it mounted: the first read at the
+// wake timed out (sdmmc 0x107, 2026-11-08). So: unmounted before the rail goes, mounted
+// again after it is back (storage_alive: a card still mounted is asked, and remounted if mute).
+void storage_sleep(bool asleep)
+{
+    if (!asleep) { storage_alive(); return; }
+    if (!mounted) return;
+    if (xSemaphoreTake(busy, pdMS_TO_TICKS(2000)) != pdTRUE) { ESP_LOGW(TAG, "the card is in use at the sleep: left mounted, asked at the wake"); return; }
+    esp_vfs_fat_sdcard_unmount(MOUNT, card);
+    card = NULL;
+    mounted = false;
+    xSemaphoreGive(busy);
+}
+
 const char *storage_dir(void) { return FOLDER; }
 
 bool storage_room(uint64_t *free_bytes, uint64_t *total_bytes)

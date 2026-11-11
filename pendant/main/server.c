@@ -365,6 +365,7 @@ static esp_err_t on_health(httpd_req_t *req)
     if (lastwords_strikes() >= 3) cJSON_AddItemToArray(problems, cJSON_CreateString("the glass is off: it stopped three starts in a row (a restart tries again)"));
     else if (!board_trouble()[0] && !ui_ok()) cJSON_AddItemToArray(problems, cJSON_CreateString("no glass answered"));
     cJSON_AddStringToObject(j, "reset", lastwords_reset());
+    cJSON_AddItemToObject(j, "sleep", power_json());                     // the sleep trail: how far the last sleep and wake got, read through any reset (0.5.3)
     cJSON *words = lastwords_json(false);
     if (words) cJSON_AddItemToObject(j, "last_words", words);
     int errors, resets, held;
@@ -872,12 +873,7 @@ static esp_err_t on_wakeword_model(httpd_req_t *req)
 static void power_task(void *what)
 {
     vTaskDelay(pdMS_TO_TICKS(2000));
-    if (what) {
-        ESP_LOGI(TAG, "shutdown: sleeping until the boot button, or a replug");
-        audio_stop();
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-        esp_deep_sleep_start();
-    }
+    if (what) power_off();                          // deep sleep with no wake: RESET or a replug. Before 0.5.5 it woke on GPIO 0, the pin the ROM reads as the download strap at a deep-sleep wake, rail left on (hunt 5.10)
     esp_restart();
 }
 

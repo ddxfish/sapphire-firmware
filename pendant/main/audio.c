@@ -15,6 +15,7 @@
 #include "model_path.h"
 
 #include "board.h"
+#include "power.h"
 #include "settings.h"
 
 static const char *TAG = "audio";
@@ -400,7 +401,7 @@ int audio_volume(void) { return settings.volume; }
 void audio_set_mute(bool on)
 {
     muted = on;
-    board_amplifier(!on);
+    board_amplifier(!on && !power_doubt());        // the dead-battery guard's try keeps the amplifier off for its first two minutes; power.c turns it on
     if (settings.mute != on) { settings.mute = on; settings_save_soon(); }
 }
 bool audio_muted(void) { return muted; }

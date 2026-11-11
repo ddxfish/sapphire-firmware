@@ -182,6 +182,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Sapphire pendant %s", PROJECT_VER);
     settings_load();
     lastwords_start();
+    power_start();
     serial_console_io();
     console_start();
     stats_start();

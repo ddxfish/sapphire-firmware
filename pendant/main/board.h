@@ -74,6 +74,7 @@ bool board_boot_down(void);            // the BOOT key, now
 // --- the expander's other pins ------------------------------------------------------
 bool board_rail(bool on);               // false: the expander did not take the write (said in the log)              // the switched 3V3 rail: off = screen, camera, mic, amplifier, card, LEDs all unpowered
 bool board_rail_on(void);
+bool board_dark(void);                  // before board_init, at a dead-battery boot (power.c): the bus up and the expander's outputs all off (rail, amplifier, lights); it kept them through the chip's reset
 void board_fill_light(bool on);        // the white LED beside the lens
 bool board_fill_light_on(void);
 void board_led(uint8_t r, uint8_t g, uint8_t b);   // the status LED (light.c paints it)

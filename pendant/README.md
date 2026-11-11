@@ -18,6 +18,7 @@ GC2145 camera, PDM mic, NS4168 amplifier, CST816S touch, AW9523 expander).
 | BOOT: press to talk (or stop her), hold to sleep. Sleep cuts the rail; BOOT wakes it | |
 | A picture: GC2145 YUV to JPEG on the chip (`snap`), `GET /camera/snap` | |
 | Backups on the card, updates over WiFi, the chat picker, her `show` and `picture` | |
+| A run-down battery: two brownouts in a row and the board deep-sleeps on a timer instead of boot-looping, trying again with the sound off, a minute apart at first, half an hour at most; RESET is "try now". Shutdown is deep sleep until RESET or a replug (0.5.5) | |
 
 ## Set up a board
 
@@ -46,7 +47,7 @@ The board's USB chip is a CH340 (`/dev/ttyUSB0`); there is no native USB.
 mic) is the canceller's cut while she speaks; `mic_hz` and `spk_hz` are the two clocks measured
 against the timer; `mic_dropped_ms`, `feed_max_ms`, `feed_slow`, `pops_stale` say whether the mic
 feed is keeping up (any drop mid-sentence and the canceller cannot converge on that sentence).
-`GET /log` (the last 160 lines the board logged, oldest first: what happened while nobody watched the console; `GET /log?last=1` is the boot before this one, kept in PSRAM across a restart, a crash or a watchdog, so the story of a death is still there after it) and `GET /stats` is the console's `tasks` without a serial port: every task's share of its core.
+`GET /log` (the last 160 lines the board logged, oldest first: what happened while nobody watched the console; `GET /log?last=1` is the boot before this one, kept in PSRAM across a restart, a crash or a watchdog, so the story of a death is still there after it; the RESET button is a power-on to the chip and the PSRAM loses its refresh for the reset: the lines come back bit-rotted or blank, 2026-11-08; `/health` → `sleep` is the trail that does read through it: how far the last sleep and its wake got, its heartbeats, its wake cause) and `GET /stats` is the console's `tasks` without a serial port: every task's share of its core.
 
 `POST /mic?...` knobs: `speaker_rate=16000|24000` (her voice; Kokoro makes 24 kHz; live),
 `aec=on|off`, `aec_delay=-100..500` (ms; negative holds the MIC that long, more lead for the

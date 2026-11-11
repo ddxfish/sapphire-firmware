@@ -19,6 +19,7 @@
 
 bool storage_start(void);                     // mount, sweep .partial files
 bool storage_alive(void);                     // as storage_ok, after asking the card: one that was pulled and put back is mounted again
+void storage_sleep(bool asleep);              // power.c around sleep: the rail takes the card's power, so unmounted before it goes, mounted again after the wake
 bool storage_ok(void);                        // a card is mounted
 bool storage_room(uint64_t *free_bytes, uint64_t *total_bytes);
 const char *storage_dir(void);                // the folder on the card
