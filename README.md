@@ -9,7 +9,8 @@ so Sapphire shows only what a board says it has.
 
 | Device | Image | Features | Notes |
 |---|---|---|---|
-| **AI speaker and mic**<br>Waveshare ESP32-S3-AUDIO-Board<br>`ai-speaker-mic/` · 0.9.5 | | • Wake word<br>• Mic<br>• Speaker<br>• Light ring<br>• Screen (optional)<br>• Touch (optional)<br>• Camera (optional)<br>• Chat picker<br>• Buttons<br>• Backups<br>• Updates over WiFi | A voice box: say the wake word, ask, hear her answer. The screen is Waveshare's 2" touch LCD; the camera is any OV2640/OV3660/OV5640. |
+| **AI speaker and mic**<br>Waveshare ESP32-S3-AUDIO-Board<br>`s3sat/` (`ai-speaker-mic`) · 1.0.0 | | • Wake word<br>• Mic<br>• Speaker<br>• Light ring<br>• Her avatar<br>• Screen (optional)<br>• Touch (optional)<br>• Camera (optional)<br>• Chat picker<br>• Actions (nine buttons)<br>• Buttons<br>• Backups<br>• Updates over WiFi | A voice box: say the wake word, ask, hear her answer. Swipe between tiles: backups, settings, voice, her avatar, actions. The screen is Waveshare's 2" touch LCD; the camera is any OV2640/OV3660/OV5640. |
+| **Sapphire pendant**<br>Elecrow AI Camera board<br>`s3sat/` (`pendant`) · 1.0.0 | | • Wake word<br>• Mic<br>• Speaker<br>• Status light<br>• Her avatar<br>• Screen<br>• Touch<br>• Camera<br>• Chat picker<br>• Actions (nine buttons)<br>• Buttons<br>• Backups<br>• Sleep<br>• Updates over WiFi | The board she is worn on. Same program as the speaker (one tree, two boards), its own glass, mic and power. |
 | **CYD 2.8" reader**<br>ESP32-2432S028R<br>`cyd/` (`cyd28`) · 0.5.2 | | • Screen<br>• Touch (resistive)<br>• Keyboard<br>• Chat picker<br>• Speaker<br>• LED<br>• Light sensor<br>• Buttons<br>• Backups<br>• Updates over WiFi | A chat in your pocket, a page at a time. Speaker needs an 8 Ω speaker on its JST 1.25 mm plug. |
 | **CYD 3.5" reader**<br>ESP32-3248S035C<br>`cyd/` (`cyd35`) · 0.5.2 | | • Screen<br>• Touch (capacitive)<br>• Keyboard<br>• Chat picker<br>• Speaker<br>• LED<br>• Light sensor<br>• Buttons<br>• Backups<br>• Updates over WiFi | Same program as the 2.8", bigger glass. Builds; not yet proven on a board. |
 | **Backup stick**<br>LilyGO T-Dongle-S3<br>`tdongle/` · 0.1.4 | | • Backups<br>• Screen<br>• LED<br>• Buttons<br>• Updates over WiFi | Plug into any USB power. Every backup is read back and checked at each start. |
@@ -43,7 +44,7 @@ Needs [ESP-IDF v5.5](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/g
 on Linux, macOS or WSL. Set `IDF_PATH` to it, then:
 
 ```
-bash build.sh cyd28             one board (a folder, or a board of a family: cyd28 and cyd35 are both cyd/)
+bash build.sh cyd28             one board (a folder, or a board of a family: cyd28 and cyd35 are both cyd/, pendant and ai-speaker-mic are both s3sat/)
 bash build.sh all               every board
 bash build.sh cyd28 clean
 bash build.sh cyd28 menuconfig
@@ -105,9 +106,10 @@ encryption. Keep boards on a network you trust.
 
 ## License
 
-The release `.bin` files also hold LVGL (MIT), TensorFlow Lite Micro (Apache 2.0), cJSON (MIT),
-ESP-IDF (Apache 2.0) and, in ai-speaker-mic's image, Espressif's esp-sr models (under the exception
-in LICENSE); their notices are in each component's source.
+The release `.bin` files also hold ESP-IDF (Apache 2.0), LVGL (MIT), TensorFlow Lite Micro (Apache 2.0),
+cJSON (MIT) and, in the pendant's and ai-speaker-mic's images, Espressif's esp-sr models and
+esp_new_jpeg (under the permission below). `THIRD-PARTY-NOTICES.txt`, published beside the images in
+each release and written by `build.sh` (`tools/notices.py`), carries every component's license text.
 
 The screens draw with Montserrat, compiled into LVGL's own component under
 the SIL Open Font License 1.1 (see its `COPYRIGHTS.md`); a font regenerated
@@ -118,19 +120,22 @@ like Sapphire.
 
 Not ours, and under their own terms:
 
-- `ai-speaker-mic/models/hey_jarvis.*`: the wake word model from ESPHome's
+- `s3sat/models/hey_jarvis.*`: the wake word model from ESPHome's
   micro-wake-word-models, Apache License 2.0. See the `NOTICE` and `LICENSE`
   in that folder.
 - What a build downloads into `managed_components/` (ESP-IDF components,
   LVGL, TensorFlow Lite Micro and others): Apache 2.0 or MIT, each with its
   license in its folder. Two of Espressif's, `esp-sr` and `esp_new_jpeg`, are
   under the "Espressif MIT" license, which allows them on Espressif chips only.
-- `ai-speaker-mic/components/esp32-camera/`: Espressif's esp32-camera 2.1.8, Apache License 2.0
+- `s3sat/components/esp32-camera/`: Espressif's esp32-camera 2.1.8, Apache License 2.0
   (its `LICENSE`), with one change of ours in `driver/cam_hal.c` marked "Sapphire patch".
   Its OpenMV sensor and SCCB drivers are MIT (`LICENSE-OpenMV` in that folder).
 
 Additional permission under section 7 of the GNU AGPL v3: you may combine
-this code with Espressif's `esp-sr` and `esp_new_jpeg` components and convey
-the result, with those two components staying under their own license. If
-you change this code you may extend the permission to your version or leave
-it out. Only the `ai-speaker-mic` program contains either of them.
+this code with Espressif's binary-only libraries and models (those distributed
+with ESP-IDF, such as its Wi-Fi, PHY and coexistence libraries, and with its
+registry components, such as `esp-sr`, `esp-dl` and `esp_new_jpeg`) and convey
+the result, with those parts staying under their own licenses and without
+their source counting as Corresponding Source. If you change this code you
+may extend the permission to your version or leave it out. `esp-sr` and
+`esp_new_jpeg` are in the `s3sat` images (pendant and ai-speaker-mic).

@@ -7,5 +7,8 @@ dist/
 __pycache__/
 *.pyc
 
+# a Claude Code session's own notes and memories: never publish
+.claude/
+
 # what was on a board before the first flash (a vendor's program: never publish)
 backups/

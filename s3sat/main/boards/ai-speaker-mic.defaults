@@ -1,0 +1,8 @@
+# The AI speaker (Waveshare ESP32-S3-AUDIO-Board): the USB line is the console (USB-Serial-JTAG; GPIO 43/44
+# are the camera's XCLK and PCLK here, never a UART); the eye is an OV sensor on the 24 pin plug (the
+# kit's OV5640), its control channel on the shared I2C bus, port 0.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_GC2145_SUPPORT=n
+CONFIG_OV3660_SUPPORT=y
+CONFIG_OV5640_SUPPORT=y
+CONFIG_SCCB_HARDWARE_I2C_PORT0=y

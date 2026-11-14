@@ -1,0 +1,621 @@
+// boards/ai-speaker-mic.c - the Waveshare ESP32-S3-AUDIO-Board: board.h's functions. The I2S shape
+// (TX standard stereo, RX TDM with four slots, one clock for both) is the one Xiaozhi proved on it.
+#include "board.h"
+#include "buttons.h"
+#include "settings.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "esp_rom_sys.h"
+#include "driver/ledc.h"
+#include "driver/spi_master.h"
+#include "esp_lcd_panel_st7789.h"
+#include "esp_lcd_touch_cst816s.h"
+#include "driver/i2s_std.h"
+#include "driver/i2s_tdm.h"
+#include "es7210_adc.h"
+#include "es8311_codec.h"
+#include "esp_codec_dev_defaults.h"
+#include "esp_io_expander_tca95xx_16bit.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#include "led_strip.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+static const char *TAG = "board";
+static i2c_master_bus_handle_t i2c;
+static esp_io_expander_handle_t expander;
+static SemaphoreHandle_t expander_lock;  // its driver read-modify-writes a cached copy: one writer at a time
+static i2c_master_dev_handle_t expander_raw;   // the chip read back: its driver only remembers what it wrote
+static const audio_codec_if_t *out_codec;
+static es8311_codec_cfg_t es8311;
+static i2s_chan_handle_t tx, rx;
+static board_audio_t audio;
+static board_glass_t glass;
+static const char *trouble = "";       // why board_init stopped, in words, for /health
+static int touch_errors, touch_bad, bus_resets, bus_held;   // bus_held: clock pulses it took to free SDA at boot, 0 = it was free
+static int64_t touch_rest_until;
+static int key_errors;                 // failed reads of the three keys
+#define TOUCH_TIMEOUT_MS 30            // one poll of the touch chip; the library's 0 means forever (the 2026-10-08 freeze)
+// The shared bus at 100 kHz with the chip's own pull-ups (1.0.0, wave 0): at 400 kHz with none, a cold
+// power-on missed the codecs ("did not answer: no sound") while a soft restart found them every time
+// (2026-11-10), and 84 touch errors in a minute; the pendant's bus had read back garbage at 400 too.
+#define BUS_HZ 100000
+#define SETTLE_MS 80                   // after the reset pulses and the amplifier: the touch chip wakes onto the bus ~50 ms after its reset
+#define TOUCH_BAD_ROW 30               // this many failed polls in a row (a second): the poll rests a second
+
+#define PIN_PA IO_EXPANDER_PIN_NUM_8
+#define PIN_LCD_RESET IO_EXPANDER_PIN_NUM_0
+#define PIN_TOUCH_RESET IO_EXPANDER_PIN_NUM_1
+#define PIN_CAMERA_DOWN IO_EXPANDER_PIN_NUM_5
+#define PIN_CAMERA_SEL IO_EXPANDER_PIN_NUM_6
+#define PIN_SD_CS IO_EXPANDER_PIN_NUM_3          // the card's D3/CS (board.h)
+#define OUTPUTS (PIN_LCD_RESET | PIN_TOUCH_RESET | PIN_CAMERA_DOWN | PIN_CAMERA_SEL | PIN_PA | PIN_SD_CS)
+#define PIN_KEYS (IO_EXPANDER_PIN_NUM_9 | IO_EXPANDER_PIN_NUM_10 | IO_EXPANDER_PIN_NUM_11)   // Key1..Key3 (board.h)
+
+static bool expander_init(void)
+{
+    // Left in its power-up state the expander lets the amplifier float, and
+    // the board is dead quiet. This is Xiaozhi's proven sequence.
+    if (esp_io_expander_new_i2c_tca95xx_16bit(i2c, ESP_IO_EXPANDER_I2C_TCA9555_ADDRESS_000, &expander) != ESP_OK) {
+        expander = NULL;
+        return false;
+    }
+    i2c_device_config_t raw = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = ESP_IO_EXPANDER_I2C_TCA9555_ADDRESS_000, .scl_speed_hz = BUS_HZ};
+    if (!expander_raw) i2c_master_bus_add_device(i2c, &raw, &expander_raw);
+    if (!expander_lock) expander_lock = xSemaphoreCreateMutex();
+    if (esp_io_expander_set_dir(expander, OUTPUTS, IO_EXPANDER_OUTPUT) != ESP_OK) {
+        esp_io_expander_del(expander);
+        expander = NULL;
+        return false;
+    }
+    esp_io_expander_set_level(expander, PIN_SD_CS, 1);           // SD mode, not SPI mode
+    esp_io_expander_set_level(expander, PIN_LCD_RESET | PIN_TOUCH_RESET, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_io_expander_set_level(expander, PIN_LCD_RESET | PIN_TOUCH_RESET, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_io_expander_set_level(expander, PIN_LCD_RESET | PIN_TOUCH_RESET, 1);
+    esp_io_expander_set_level(expander, PIN_CAMERA_DOWN, 1);      // the camera stays powered DOWN until a shot (camera.c); Xiaozhi left it on
+    esp_io_expander_set_level(expander, PIN_CAMERA_SEL, 1);        // its clocks on GPIO 43/44, never 19/20 (USB)
+    esp_io_expander_set_level(expander, PIN_PA, 0);   // driven, but OFF until the codecs are up: main's audio_set_mute turns it on (a soft restart popped through it, 2026-11-13)
+    vTaskDelay(pdMS_TO_TICKS(SETTLE_MS));                           // the codecs are written next: nothing else waking onto the bus meanwhile
+    return true;
+}
+
+static bool i2s_init(int rate)
+{
+    i2s_chan_config_t chan = {
+        .id = I2S_NUM_0, .role = I2S_ROLE_MASTER, .dma_desc_num = 6, .dma_frame_num = 240,
+        .auto_clear_after_cb = true,
+    };
+    if (i2s_new_channel(&chan, &tx, &rx) != ESP_OK) return false;
+    i2s_std_config_t std = {
+        .clk_cfg = {.sample_rate_hz = rate, .clk_src = I2S_CLK_SRC_DEFAULT, .mclk_multiple = I2S_MCLK_MULTIPLE_256},
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {.mclk = GPIO_NUM_12, .bclk = GPIO_NUM_13, .ws = GPIO_NUM_14,
+                     .dout = GPIO_NUM_16, .din = I2S_GPIO_UNUSED},
+    };
+    i2s_tdm_config_t tdm = {
+        .clk_cfg = {.sample_rate_hz = rate, .clk_src = I2S_CLK_SRC_DEFAULT,
+                    .mclk_multiple = I2S_MCLK_MULTIPLE_256, .bclk_div = 8},
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO,
+                                                        I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3),
+        .gpio_cfg = {.mclk = GPIO_NUM_12, .bclk = GPIO_NUM_13, .ws = GPIO_NUM_14,
+                     .dout = I2S_GPIO_UNUSED, .din = GPIO_NUM_15},
+    };
+    return i2s_channel_init_std_mode(tx, &std) == ESP_OK && i2s_channel_init_tdm_mode(rx, &tdm) == ESP_OK
+        && i2s_channel_enable(tx) == ESP_OK && i2s_channel_enable(rx) == ESP_OK;
+}
+
+// The ES8311's power, clock and routing registers as boot left them; volume (0x32) and mute (0x31) move, so they are not here.
+#define CODEC_REGS 8
+static const int codec_regs[CODEC_REGS] = {0x00, 0x01, 0x0D, 0x0E, 0x12, 0x14, 0x37, 0x44};
+static int codec_want[CODEC_REGS];
+static int speaker_heals;
+static char speaker_last[64] = "";
+static int codec_rate;
+
+static bool codecs_init(int rate)
+{
+    codec_rate = rate;
+    audio_codec_i2s_cfg_t i2s_cfg = {.port = I2S_NUM_0, .rx_handle = rx, .tx_handle = tx};
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
+    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
+    audio_codec_i2c_cfg_t i2c_cfg = {.port = 0, .addr = ES8311_CODEC_DEFAULT_ADDR, .bus_handle = i2c};
+    const audio_codec_ctrl_if_t *out_ctrl = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    i2c_cfg.addr = ES7210_CODEC_DEFAULT_ADDR;
+    const audio_codec_ctrl_if_t *in_ctrl = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    if (!data_if || !gpio_if || !out_ctrl || !in_ctrl) return false;
+
+    es8311 = (es8311_codec_cfg_t){
+        .ctrl_if = out_ctrl, .gpio_if = gpio_if, .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin = -1,                                 // the amplifier is on the expander
+        .use_mclk = true, .hw_gain = {.pa_voltage = 5.0, .codec_dac_voltage = 3.3},
+    };
+    es7210_codec_cfg_t es7210 = {
+        .ctrl_if = in_ctrl,
+        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3 | ES7210_SEL_MIC4,
+    };
+    out_codec = es8311_codec_new(&es8311);
+    const audio_codec_if_t *in_codec = es7210_codec_new(&es7210);
+    if (!out_codec || !in_codec) return false;
+
+    esp_codec_dev_cfg_t out_cfg = {.dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = out_codec, .data_if = data_if};
+    esp_codec_dev_cfg_t in_cfg = {.dev_type = ESP_CODEC_DEV_TYPE_IN, .codec_if = in_codec, .data_if = data_if};
+    audio.out = esp_codec_dev_new(&out_cfg);
+    audio.in = esp_codec_dev_new(&in_cfg);
+    if (!audio.out || !audio.in) return false;
+
+    esp_codec_dev_sample_info_t play = {.bits_per_sample = 16, .channel = 1, .sample_rate = rate};
+    esp_codec_dev_sample_info_t record = {.bits_per_sample = 16, .channel = BOARD_SLOTS,
+                                          .channel_mask = BOARD_TAKE, .sample_rate = rate};
+    if (esp_codec_dev_open(audio.out, &play) != 0 || esp_codec_dev_open(audio.in, &record) != 0) return false;
+    esp_codec_dev_set_out_vol(audio.out, 70);
+    esp_codec_dev_set_in_channel_gain(audio.in, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), settings.mic_gain_x2 / 2.0f);
+    for (int i = 0; i < CODEC_REGS; i++) out_codec->get_reg(out_codec, codec_regs[i], &codec_want[i]);
+    return true;
+}
+
+// The reset button restarts this chip only: the six chips on the bus keep
+// their power, and one cut off mid-answer holds the data line down until it is
+// clocked out. So before the driver takes the pins: if SDA is held, up to nine
+// clock pulses and a STOP, by hand. Not i2c_master_bus_reset: called at boot it
+// left the ES8311 unreachable for the whole of codecs_init, three boots of
+// three (2026-10-09), and no sound came up.
+static void bus_clear(int sda, int scl)
+{
+    gpio_config_t pins = {.pin_bit_mask = 1ULL << sda | 1ULL << scl, .mode = GPIO_MODE_INPUT_OUTPUT_OD, .pull_up_en = GPIO_PULLUP_ENABLE};
+    gpio_config(&pins);
+    gpio_set_level(sda, 1);
+    gpio_set_level(scl, 1);
+    esp_rom_delay_us(10);
+    int pulses = 0;
+    while (!gpio_get_level(sda) && pulses < 9) {
+        gpio_set_level(scl, 0); esp_rom_delay_us(5);
+        gpio_set_level(scl, 1); esp_rom_delay_us(5);
+        pulses++;
+    }
+    if (pulses) {
+        bus_held = pulses;
+        ESP_LOGW(TAG, "the I2C data line was held down at boot: %d clock pulses %s it", pulses, gpio_get_level(sda) ? "freed" : "did NOT free");
+        gpio_set_level(scl, 0); esp_rom_delay_us(5);
+        gpio_set_level(sda, 0); esp_rom_delay_us(5);
+        gpio_set_level(scl, 1); esp_rom_delay_us(5);
+        gpio_set_level(sda, 1); esp_rom_delay_us(5);          // STOP
+    }
+    gpio_reset_pin(sda);
+    gpio_reset_pin(scl);
+}
+
+// --- the battery: see board.h -----------------------------------------------------
+static adc_oneshot_unit_handle_t adc;
+static adc_cali_handle_t adc_cali;
+#define BATTERY_CHANNEL ADC_CHANNEL_5    // GPIO 6 (BOARD_BATTERY_GPIO)
+#define BATTERY_READS 16
+#define BATTERY_MIN_MV 2800              // under this nothing runs; over 4400 it is not a cell
+#define BATTERY_MAX_MV 4400
+#define BATTERY_STEADY_MV 120            // 16 reads of a cell behind 100 nF sit within this; a floating pin does not
+
+static void battery_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit = {.unit_id = ADC_UNIT_1};
+    if (adc_oneshot_new_unit(&unit, &adc) != ESP_OK) { adc = NULL; ESP_LOGW(TAG, "the ADC did not start: no battery reading"); return; }
+    // 0..3.1 V at the pin: a cell shows 0.9..1.5, a pin tied high shows 3.3 (so a wrong jumper is seen, not clipped)
+    adc_oneshot_chan_cfg_t ch = {.atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
+    adc_oneshot_config_channel(adc, BATTERY_CHANNEL, &ch);
+    adc_cali_curve_fitting_config_t cal = {.unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
+    if (adc_cali_create_scheme_curve_fitting(&cal, &adc_cali) != ESP_OK) adc_cali = NULL;   // then the raw count against the range, roughly
+}
+
+static int pad_mv(int raw)
+{
+    int mv;
+    if (adc_cali && adc_cali_raw_to_voltage(adc_cali, raw, &mv) == ESP_OK) return mv;
+    return raw * 3100 / 4095;
+}
+
+// A lithium cell's resting voltage against its charge, the usual curve. While it charges it reads high.
+static int battery_percent(int mv)
+{
+    static const int curve[][2] = {{4200, 100}, {4100, 90}, {4000, 78}, {3900, 62}, {3800, 45},
+                                   {3700, 25}, {3600, 12}, {3500, 5}, {3400, 2}, {3300, 0}};
+    const int n = sizeof curve / sizeof curve[0];
+    if (mv >= curve[0][0]) return 100;
+    for (int i = 1; i < n; i++) {
+        if (mv >= curve[i][0]) {
+            int v0 = curve[i][0], p0 = curve[i][1], v1 = curve[i - 1][0], p1 = curve[i - 1][1];
+            return p0 + (mv - v0) * (p1 - p0) / (v1 - v0);
+        }
+    }
+    return 0;
+}
+
+bool board_battery_read(board_battery_t *out)
+{
+    memset(out, 0, sizeof *out);
+    out->percent = -1;
+    if (!adc) return false;
+    int sum = 0, lo = 4095, hi = 0, n = 0;
+    for (int i = 0; i < BATTERY_READS; i++) {
+        int raw;
+        if (adc_oneshot_read(adc, BATTERY_CHANNEL, &raw) != ESP_OK) continue;
+        sum += raw; n++;
+        if (raw < lo) lo = raw;
+        if (raw > hi) hi = raw;
+    }
+    if (!n) return false;
+    out->raw = sum / n;
+    out->pad_mv = pad_mv(out->raw);
+    out->mv = out->pad_mv * BOARD_BATTERY_DIVIDER;
+    out->spread_mv = (pad_mv(hi) - pad_mv(lo)) * BOARD_BATTERY_DIVIDER;
+    out->battery = out->mv >= BATTERY_MIN_MV && out->mv <= BATTERY_MAX_MV && out->spread_mv <= BATTERY_STEADY_MV;
+    if (out->battery) out->percent = battery_percent(out->mv);
+    return true;
+}
+
+// A soft restart resets the S3, not the expander: the amplifier stayed on while the codec was torn down and
+// brought back, and played the glitch (Krem, 2026-11-13). Off before any esp_restart; on again at the end of boot.
+static void amp_off_for_restart(void) { if (expander) esp_io_expander_set_level(expander, PIN_PA, 0); }
+
+bool board_init(int rate)
+{
+    battery_init();                    // first: it needs no bus, and a bus that fails must not take it down
+    gpio_config(&(gpio_config_t){.pin_bit_mask = 1ULL << BOARD_BOOT_BUTTON, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE});   // BOOT is fed by main's task now (BUTTON_FED): set up here, not by buttons.c
+    i2c_master_bus_config_t bus = {.i2c_port = 0, .sda_io_num = GPIO_NUM_11, .scl_io_num = GPIO_NUM_10,
+                                   .clk_source = I2C_CLK_SRC_DEFAULT, .flags.enable_internal_pullup = true};
+    bus_clear(bus.sda_io_num, bus.scl_io_num);
+    if (i2c_new_master_bus(&bus, &i2c) != ESP_OK) { ESP_LOGE(TAG, "%s", trouble = "the I2C bus did not start"); return false; }
+    bool have = false;
+    for (int n = 0; n < 3 && !(have = expander_init()); n++) {
+        ESP_LOGW(TAG, "the TCA9555 did not answer (try %d)", n + 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!have) { ESP_LOGE(TAG, "%s", trouble = "the port expander (TCA9555) did not answer: no glass, no sound, no card"); return false; }
+    if (!i2s_init(rate)) { ESP_LOGE(TAG, "%s", trouble = "I2S did not start: no sound"); return false; }
+    bool sound = false;
+    for (int n = 0; n < 3 && !(sound = codecs_init(rate)); n++) {   // a cold start missed them once in a few: asked again, after a rest
+        ESP_LOGW(TAG, "a sound chip did not answer (try %d)", n + 1);
+        vTaskDelay(pdMS_TO_TICKS(150 * (n + 1)));
+    }
+    if (!sound) { ESP_LOGE(TAG, "%s", trouble = "a sound chip (ES8311 or ES7210) did not answer: no sound"); return false; }
+    esp_register_shutdown_handler(amp_off_for_restart);
+    ESP_LOGI(TAG, "%s ready at %d Hz", BOARD_NAME, rate);
+    return true;
+}
+
+board_audio_t *board_audio(void) { return &audio; }
+const char *board_trouble(void) { return trouble; }
+void board_i2c_counts(int *errors, int *resets, int *held) { *errors = touch_errors; *resets = bus_resets; *held = bus_held; }
+
+bool board_sd_select(bool high)
+{
+    if (!expander) return false;
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    bool ok = esp_io_expander_set_level(expander, PIN_SD_CS, high ? 1 : 0) == ESP_OK;
+    xSemaphoreGive(expander_lock);
+    return ok;
+}
+
+void board_camera_power(bool on)
+{
+    if (!expander) return;
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    esp_io_expander_set_level(expander, PIN_CAMERA_DOWN, on ? 0 : 1);   // PWDN is active high
+    xSemaphoreGive(expander_lock);
+}
+
+// One read of the expander's inputs, from the buttons' task. A failed read
+// is "not known" and a second's rest, never a stop: the bus is shared with
+// the codecs, the touch chip and the camera, and the library waits a whole
+// second on a bus that does not answer.
+int board_keys(void)
+{
+    static int64_t rest_until;
+    if (!expander) return -1;
+    int64_t now = esp_timer_get_time();
+    if (now < rest_until) return -1;
+    uint32_t levels = 0;
+    if (esp_io_expander_get_level(expander, PIN_KEYS, &levels) != ESP_OK) {
+        key_errors++;
+        rest_until = now + 1000000;
+        return -1;
+    }
+    return (int)((~levels >> 9) & 7);
+}
+
+void board_amplifier(bool on)
+{
+    if (!expander) return;
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    esp_io_expander_set_level(expander, PIN_PA, on);
+    xSemaphoreGive(expander_lock);
+}
+
+// Her voice reaches the air only while two chips still hold what boot told
+// them: the expander's amplifier pin as a driven output, and the ES8311's
+// power and clock registers. A dip on the rail can reset either one and not
+// this chip, and nothing else notices: I2S drains at real speed into a codec
+// that is not listening, and the expander's driver writes only what differs
+// from its cached copy, so no re-assert reaches the wire (2026-10-19: silent
+// until a restart). So whoever takes the speaker looks first, a few register
+// reads, and puts back what is gone. -1 not readable, 0 fine, 1 healed.
+int board_speaker_check(void)
+{
+    if (!expander || !expander_raw || !out_codec) return -1;
+    char why[64] = "";
+    uint8_t cfg[2], out[2];
+    xSemaphoreTake(expander_lock, portMAX_DELAY);
+    bool read = i2c_master_transmit_receive(expander_raw, (uint8_t[]){0x06}, 1, cfg, 2, 50) == ESP_OK
+             && i2c_master_transmit_receive(expander_raw, (uint8_t[]){0x02}, 1, out, 2, 50) == ESP_OK;
+    if (read) {
+        uint32_t dir = cfg[0] | cfg[1] << 8, lvl = out[0] | out[1] << 8, want_lvl = 0, want_dir = 0;
+        expander->read_output_reg(expander, &want_lvl);           // the driver's copy
+        expander->read_direction_reg(expander, &want_dir);
+        if ((dir & OUTPUTS) || ((lvl ^ want_lvl) & OUTPUTS)) {
+            snprintf(why, sizeof why, "expander pins %04x/%04x", (unsigned)dir, (unsigned)lvl);
+            expander->write_output_reg(expander, want_lvl);
+            expander->write_direction_reg(expander, want_dir);
+        }
+    }
+    xSemaphoreGive(expander_lock);
+    if (!read) return -1;
+    for (int i = 0; i < CODEC_REGS; i++) {
+        int v = -1;
+        if (out_codec->get_reg(out_codec, codec_regs[i], &v) != 0) return -1;
+        if (v == codec_want[i]) continue;
+        size_t n = strlen(why);
+        snprintf(why + n, sizeof why - n, "%scodec %02x=%02x", n ? ", " : "", codec_regs[i], v);
+        esp_codec_dev_sample_info_t play = {.bits_per_sample = 16, .channel = 1, .sample_rate = codec_rate};
+        esp_codec_dev_close(audio.out);                           // the whole ES8311 setup again, as boot did it
+        out_codec->open(out_codec, &es8311, sizeof es8311);
+        esp_codec_dev_open(audio.out, &play);
+        esp_codec_dev_set_out_vol(audio.out, settings.volume);
+        break;
+    }
+    if (!why[0]) return 0;
+    speaker_heals++;
+    strlcpy(speaker_last, why, sizeof speaker_last);
+    ESP_LOGW(TAG, "the speaker had gone deaf (%s): put back (%d times so far)", why, speaker_heals);
+    return strncmp(why, "expander", 8) ? 2 : 1;          // 1 = the expander was reset (its reset lines feed the glass: ui_heal); 2 = the codec alone
+}
+
+int board_speaker_heals(const char **last) { *last = speaker_last; return speaker_heals; }
+
+// The speaker's volume, landed for sure (1.0.0): a write on a busy shared bus can fail mid-transaction
+// ("Fail to write to dev 30", a movie playing and the dial turned, 2026-11-12) and the chip keeps the old
+// value, or worse. So written until two read-backs in a row agree, and the DAC's mute bits (0x31, never
+// ours: the amplifier is our mute) put back if a garbled write set them. Safe under her voice: no reopen.
+bool board_out_volume(int level)
+{
+    if (!audio.out || !out_codec) return false;
+    int prev = -1;
+    for (int n = 0; n < 4; n++) {
+        esp_codec_dev_set_out_vol(audio.out, level);
+        int now = -1;
+        if (out_codec->get_reg(out_codec, 0x32, &now) == 0 && now == prev) {
+            int m = 0;
+            if (out_codec->get_reg(out_codec, 0x31, &m) == 0 && (m & 0x60)) out_codec->set_reg(out_codec, 0x31, m & 0x9f);
+            return true;
+        }
+        prev = now;
+        if (n) vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGW(TAG, "the speaker's volume did not take (the bus is busy)");
+    return false;
+}
+
+// Who answers on the shared bus: 0x18 ES8311, 0x20 TCA9555, 0x40 ES7210, and
+// with the plugs filled 0x15 (CST816 touch) and 0x3c (an OV camera's SCCB,
+// only while EXIO5 powers it).
+int board_i2c_scan(cJSON *list)
+{
+    if (!i2c) return -1;
+    int found = 0;
+    for (int addr = 0x08; addr < 0x78; addr++) {
+        if (i2c_master_probe(i2c, addr, 50) == ESP_OK) { cJSON_AddItemToArray(list, cJSON_CreateNumber(addr)); found++; }
+    }
+    return found;
+}
+
+// --- the glass ---------------------------------------------------------------------
+
+board_glass_t *board_glass(void) { return &glass; }
+
+// One poll of the touch chip, from LVGL's task. A failed read is a lifted
+// finger and a count, never a stop: esp_lvgl_port's own reader aborts the
+// program on any error (ESP_ERROR_CHECK), so the glass does not use it.
+bool board_touch_read(int *x, int *y)
+{
+    if (!glass.touch) return false;
+    int64_t now = esp_timer_get_time();
+    if (now < touch_rest_until) return false;
+    if (esp_lcd_touch_read_data(glass.touch) != ESP_OK) {
+        touch_errors++;
+        if (++touch_bad >= TOUCH_BAD_ROW) {
+            touch_bad = 0;
+            bus_resets++;                             // the driver resets its own state after a timeout; a rest lets the bus settle
+            ESP_LOGW(TAG, "the touch chip stopped answering for a second (%d times so far)", bus_resets);
+            touch_rest_until = now + 1000000;
+        }
+        return false;
+    }
+    touch_bad = 0;
+    esp_lcd_touch_point_data_t p[1];
+    uint8_t n = 0;
+    if (esp_lcd_touch_get_data(glass.touch, p, &n, 1) != ESP_OK || !n) return false;
+    *x = p[0].x;
+    *y = p[0].y;
+    return true;
+}
+
+void board_backlight(int percent)
+{
+    if (!glass.up) return;
+    percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, percent * 255 / 100);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+void board_glass_orient(bool invert, bool flip, bool mirror)
+{
+    if (!glass.panel) return;
+    esp_lcd_panel_invert_color(glass.panel, invert);
+    esp_lcd_panel_swap_xy(glass.panel, true);          // landscape: a quarter turn; flip = the other quarter (180 from it)
+    esp_lcd_panel_mirror(glass.panel, !flip ^ mirror, flip);
+    if (glass.touch) {
+        esp_lcd_touch_set_swap_xy(glass.touch, true);
+        esp_lcd_touch_set_mirror_x(glass.touch, !flip ^ mirror);
+        esp_lcd_touch_set_mirror_y(glass.touch, flip);
+    }
+}
+
+bool board_glass_init(void)
+{
+    if (!i2c || !expander) { ESP_LOGW(TAG, "no glass: the bus is not up"); return false; }
+    // the backlight: PWM at 25 kHz, 8 bit, dark until the screen is built. Not 5 kHz:
+    // that sat in the audio band and the quiet room read 4x louder on the mics with
+    // the backlight dimmed (2026-10-07); above 8 kHz the 16 kHz mic path cannot see it.
+    ledc_timer_config_t t = {.speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_8_BIT,
+                             .timer_num = LEDC_TIMER_0, .freq_hz = 25000, .clk_cfg = LEDC_AUTO_CLK};
+    ledc_timer_config(&t);
+    ledc_channel_config_t c = {.gpio_num = BOARD_LCD_BL, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
+                               .timer_sel = LEDC_TIMER_0, .duty = 0, .hpoint = 0};
+    ledc_channel_config(&c);
+    // the panel. Its reset line is EXIO0, pulsed in expander_init already.
+    spi_bus_config_t bus = {.sclk_io_num = BOARD_LCD_SCK, .mosi_io_num = BOARD_LCD_MOSI, .miso_io_num = -1,
+                            .quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = BOARD_W * BOARD_DRAW_LINES * 2};
+    if (spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO) != ESP_OK) { ESP_LOGE(TAG, "the glass's SPI bus did not start"); return false; }
+    esp_lcd_panel_io_spi_config_t io = {.dc_gpio_num = BOARD_LCD_DC, .cs_gpio_num = BOARD_LCD_CS, .pclk_hz = BOARD_LCD_HZ,
+                                        .lcd_cmd_bits = 8, .lcd_param_bits = 8, .spi_mode = 0, .trans_queue_depth = 10,
+                                        .flags.psram_dma_direct = true};      // LVGL's draw buffers live in PSRAM: the DMA reads them there
+    if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io, &glass.io) != ESP_OK) return false;
+    esp_lcd_panel_dev_config_t panel = {.reset_gpio_num = -1, .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB, .bits_per_pixel = 16};
+    if (esp_lcd_new_panel_st7789(glass.io, &panel, &glass.panel) != ESP_OK) { ESP_LOGE(TAG, "no ST7789"); return false; }
+    esp_lcd_panel_reset(glass.panel);
+    esp_lcd_panel_init(glass.panel);
+    // the touch chip: a CST816 at 0x15 on the shared bus, polled (its INT is on the expander)
+    esp_lcd_panel_io_i2c_config_t tp_io = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
+    tp_io.scl_speed_hz = BUS_HZ;
+    tp_io.transaction_timeout_ms = TOUCH_TIMEOUT_MS;
+    esp_lcd_panel_io_handle_t tp_io_h = NULL;
+    esp_lcd_touch_config_t tp = {.x_max = BOARD_PANEL_W, .y_max = BOARD_PANEL_H, .rst_gpio_num = -1, .int_gpio_num = -1,
+                                 .levels = {.reset = 0, .interrupt = 0}};
+    if (esp_lcd_new_panel_io_i2c(i2c, &tp_io, &tp_io_h) != ESP_OK
+        || esp_lcd_touch_new_i2c_cst816s(tp_io_h, &tp, &glass.touch) != ESP_OK) {
+        ESP_LOGW(TAG, "no touch chip answered at 0x15: the glass shows, taps do nothing");
+        glass.touch = NULL;
+    }
+    // a sleeping CST816 answers nothing between touches; the poll would log an error 30 times a second
+    esp_log_level_set("CST816S", ESP_LOG_NONE);
+    esp_log_level_set("lcd_panel.io.i2c", ESP_LOG_NONE);
+    glass.up = true;
+    board_glass_orient(settings.invert, settings.flip, settings.mirror);
+    esp_lcd_panel_disp_on_off(glass.panel, true);
+    ESP_LOGI(TAG, "glass up: ST7789 %dx%d landscape at %d MHz, touch %s", BOARD_W, BOARD_H, BOARD_LCD_HZ / 1000000, glass.touch ? "CST816" : "MISSING");
+    return true;
+}
+
+
+// Panel and touch set up again, as boot did (ui_heal after an expander heal: a reset line may have dropped).
+bool board_glass_wake(void)
+{
+    if (!glass.panel) return false;
+    esp_lcd_panel_reset(glass.panel);
+    esp_lcd_panel_init(glass.panel);
+    board_glass_orient(settings.invert, settings.flip, settings.mirror);
+    esp_lcd_panel_disp_on_off(glass.panel, true);
+    return true;
+}
+
+// One register of the touch chip, raw (the console's `touch raw`): its own device on the shared bus.
+int board_touch_reg(int reg)
+{
+    static i2c_master_dev_handle_t dev;
+    if (!i2c) return -1;
+    if (!dev) {
+        i2c_device_config_t c = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = 0x15, .scl_speed_hz = BUS_HZ};
+        if (i2c_master_bus_add_device(i2c, &c, &dev) != ESP_OK) { dev = NULL; return -1; }
+    }
+    uint8_t v;
+    return i2c_master_transmit_receive(dev, (uint8_t[]){(uint8_t)reg}, 1, &v, 1, 50) == ESP_OK ? v : -1;
+}
+
+// --- the ring: seven WS2812 on GPIO 38 (light.c draws, these show) ---------------------------
+static led_strip_handle_t strip;
+
+bool board_leds_start(void)
+{
+    led_strip_config_t cfg = {
+        .strip_gpio_num = BOARD_LED_GPIO,
+        .max_leds = BOARD_LEDS,
+        .led_model = LED_MODEL_WS2812,
+        // RGB, not the usual GRB: sent as GRB, red showed as green (2026-09-29)
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB,
+        .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt = {.clk_src = RMT_CLK_SRC_DEFAULT, .resolution_hz = 10 * 1000 * 1000};
+    if (led_strip_new_rmt_device(&cfg, &rmt, &strip) != ESP_OK) { strip = NULL; ESP_LOGE(TAG, "the ring did not start"); return false; }
+    return true;
+}
+void board_led_set(int i, uint8_t r, uint8_t g, uint8_t b) { if (strip && i >= 0 && i < BOARD_LEDS) led_strip_set_pixel(strip, i, r, g, b); }
+void board_leds_show(void) { if (strip) led_strip_refresh(strip); }
+void board_leds_clear(void) { if (strip) led_strip_clear(strip); }
+
+// --- its buttons. BOOT, the three keys on the expander, then the glass's seven places: the four corners,
+// the top (the clock: the status page), the bottom (the chat's name: the picker), the middle (the halo:
+// listen, or stop her). Left alone the real buttons are a remote for a board with no glass: volume at the two
+// ends (BOOT down, Key3 up), Key1 listens or stops her, Key2 the ring, held the wake word, twice the speaker. ---
+static const button_def_t BUTTONS[] = {
+    {"boot", BUTTON_FED, {"quieter", NULL, NULL}},
+    {"key1", BUTTON_FED, {"listen", NULL, NULL}},
+    {"key2", BUTTON_FED, {"light", "wake", "mute"}},
+    {"key3", BUTTON_FED, {"louder", NULL, NULL}},
+    {"top-left", BUTTON_TAP, {"light", NULL, NULL}},
+    {"top-right", BUTTON_TAP, {"screen", NULL, NULL}},
+    {"bottom-left", BUTTON_TAP, {"wake", NULL, NULL}},
+    {"bottom-right", BUTTON_TAP, {"mute", NULL, NULL}},
+    {"top", BUTTON_TAP, {"status", NULL, NULL}},
+    {"bottom", BUTTON_TAP, {"chats", NULL, NULL}},
+    {"middle", BUTTON_TAP, {"listen", NULL, NULL}},
+    // the nine on the Actions tile: a tap each, nothing of the board's own; Settings > Devices > Buttons sets them. LAST: the no-glass cut keeps the head
+    {"a", BUTTON_TAP, {NULL, NULL, NULL}}, {"b", BUTTON_TAP, {NULL, NULL, NULL}}, {"c", BUTTON_TAP, {NULL, NULL, NULL}},
+    {"d", BUTTON_TAP, {NULL, NULL, NULL}}, {"e", BUTTON_TAP, {NULL, NULL, NULL}}, {"f", BUTTON_TAP, {NULL, NULL, NULL}},
+    {"g", BUTTON_TAP, {NULL, NULL, NULL}}, {"h", BUTTON_TAP, {NULL, NULL, NULL}}, {"i", BUTTON_TAP, {NULL, NULL, NULL}},
+};
+const button_def_t *board_buttons(size_t *n) { *n = sizeof BUTTONS / sizeof BUTTONS[0]; return BUTTONS; }
+bool board_boot_down(void) { return !gpio_get_level(BOARD_BOOT_BUTTON); }
+
+void board_console_io(void)
+{
+    // stdin/stdout on the USB serial port, blocking reads, so fgets() works. NEVER a UART here:
+    // GPIO 43/44 are the camera's XCLK and PCLK on this board.
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    cfg.rx_buffer_size = 4096;         // a setup line carries Sapphire's certificate in one go
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
+    usb_serial_jtag_vfs_use_driver();
+    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_CRLF);
+    usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_LF);
+    setvbuf(stdin, NULL, _IONBF, 0);
+}
+
+// --- what this board has not, answered honestly (board.h) ------------------------------------
+bool board_speaker_rate(int rate) { return rate == BOARD_SPEAKER_RATE; }   // one clock for the mics and the speaker: 16 kHz for good
+bool board_rail(bool on) { return false; }               // no switched rail: its parts are powered while the chip is
+bool board_rail_on(void) { return true; }
+bool board_dark(void) { board_amplifier(false); return expander != NULL; }   // all it can turn off: the amplifier (nothing else is switched)
+void board_fill_light(bool on) {}
+bool board_fill_light_on(void) { return false; }
+void board_glass_gap(int y) {}
+int board_glass_gap_now(void) { return 0; }
+bool board_touch_int(void) { return false; }             // its INT is on the expander (EXIO2): the chip is polled
